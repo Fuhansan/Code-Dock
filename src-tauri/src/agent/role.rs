@@ -1,0 +1,130 @@
+//! Role configuration — the multi-dimensional definition of an Agent.
+//!
+//! Per AIDOCK_DESIGN.md §5, a Role is NOT just a system prompt. It bundles
+//! model choice, sampling, tool grants, context strategy, work-loop mode, and
+//! token budget. For V0.1 only the fields the runtime actually consumes are
+//! populated; the rest are reserved (`Option`) so future sprints can fill
+//! them without reshaping the type.
+
+use serde::{Deserialize, Serialize};
+
+use crate::agent::message::AgentId;
+
+/// Which provider+model pair this role uses, plus sampling knobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Provider id matching an `LLMProvider::provider_id()`. V0.1: `"bailian"`.
+    pub provider: String,
+    pub primary: String,
+    /// Optional fallback model on the same provider (Sprint 3+ may use it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    /// Reserved for `qwen3-vl-*` / extended-thinking models. V0.1: false.
+    #[serde(default)]
+    pub extended_thinking: bool,
+}
+
+/// Per-call & per-session budget caps. Cheap protection against runaway agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Budget {
+    pub per_call_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_session_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_session_calls: Option<u32>,
+}
+
+/// Loop mode the runtime should drive this Agent with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopMode {
+    /// One LLM call → emit messages → done. V0.1 default.
+    Single,
+    /// Think → Act → Observe → repeat (Sprint 2.4+).
+    React,
+    /// Plan up front, then execute steps without re-planning (Sprint 3+).
+    PlanExecute,
+}
+
+impl Default for LoopMode {
+    fn default() -> Self {
+        LoopMode::Single
+    }
+}
+
+/// Full role definition. The runtime reads this; the workshop editor (Sprint
+/// V0.3) will eventually write it. For V0.1 these are hardcoded in 2.2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleConfig {
+    /// Stable id — `"PM"`, `"frontend_dev"`, `"backend_dev"`, etc.
+    pub id: AgentId,
+    /// Human-readable display name shown in the UI.
+    pub display_name: String,
+    /// Short, one-line description of responsibilities.
+    pub description: String,
+    /// The Agent's system prompt. May be long, but should not embed runtime
+    /// state (which goes via context injection).
+    pub system_prompt: String,
+
+    pub model: ModelConfig,
+    pub budget: Budget,
+
+    /// Allowlist of tool names the Agent may call (Sprint 4 wires actual MCP
+    /// tools; for now these are message kinds + recall tools).
+    pub tools: Vec<String>,
+
+    /// Other roles this Agent is expected to collaborate with frequently.
+    /// Surfaces in the system prompt so the model knows the team layout.
+    #[serde(default)]
+    pub teammates: Vec<AgentId>,
+
+    #[serde(default)]
+    pub loop_mode: LoopMode,
+
+    /// Reserved for Sprint 2.5 context-builder caps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_mode_default_is_single() {
+        assert_eq!(LoopMode::default(), LoopMode::Single);
+    }
+
+    #[test]
+    fn role_config_serializes_with_default_loop_mode() {
+        let r = RoleConfig {
+            id: "PM".into(),
+            display_name: "Product Manager".into(),
+            description: "x".into(),
+            system_prompt: "you are PM".into(),
+            model: ModelConfig {
+                provider: "bailian".into(),
+                primary: "qwen3.6-plus".into(),
+                fallback: None,
+                temperature: 0.5,
+                max_tokens: 4096,
+                extended_thinking: false,
+            },
+            budget: Budget {
+                per_call_tokens: 8000,
+                per_session_tokens: None,
+                per_session_calls: None,
+            },
+            tools: vec!["BROADCAST".into(), "ASK_AGENT".into()],
+            teammates: vec!["frontend_dev".into()],
+            loop_mode: LoopMode::default(),
+            max_history_tokens: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["id"], "PM");
+        assert_eq!(v["model"]["provider"], "bailian");
+        assert_eq!(v["loop_mode"], "single");
+    }
+}

@@ -14,9 +14,10 @@
 //! ```
 
 mod commands;
-// `keyring_store` and `llm` are `pub` so dev tools under `examples/` (e.g.
-// the Sprint 1 tool-use stability harness) can reuse them. The Tauri command
-// surface stays private — frontend talks through `commands` only.
+// `keyring_store`, `llm`, and `agent` are `pub` so dev tools under `examples/`
+// can reuse them. The Tauri command surface stays private — frontend talks
+// through `commands` only.
+pub mod agent;
 pub mod keyring_store;
 pub mod llm;
 
