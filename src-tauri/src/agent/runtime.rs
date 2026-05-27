@@ -35,9 +35,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use tauri::Emitter;
+
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
-use crate::agent::mcp::{McpClient, MCP_TOOL_PREFIX};
+use crate::agent::mcp::{make_call_event, McpClient, MCP_CALL_EVENT, MCP_TOOL_PREFIX};
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
@@ -128,6 +130,10 @@ pub struct AgentBoot {
     /// Shared MCP client handle (Sprint 4). `None` when the filesystem
     /// MCP server failed to start — agents run chat-only in that case.
     pub mcp: Option<McpClient>,
+    /// Tauri handle for emitting MCP tool-call events to the chat panel
+    /// (Sprint 4.5). `None` in headless dev harnesses; the runtime
+    /// silently skips emission when absent.
+    pub app_handle: Option<tauri::AppHandle>,
 }
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
@@ -147,6 +153,7 @@ async fn run_agent(boot: AgentBoot) {
         initial_scratchpad,
         scratchpad_path,
         mcp,
+        app_handle,
     } = boot;
 
     tracing::info!(
@@ -292,7 +299,7 @@ async fn run_agent(boot: AgentBoot) {
                         Err(e) => format!("scratchpad update failed: {e}"),
                     }
                 } else if is_mcp_tool(name) {
-                    match mcp.as_ref() {
+                    let body = match mcp.as_ref() {
                         Some(client) => match client.call_tool(name, args).await {
                             Ok(body) => {
                                 tracing::info!(
@@ -319,7 +326,22 @@ async fn run_agent(boot: AgentBoot) {
                         None => format!(
                             "MCP tool '{name}' is not available — the filesystem server didn't start this session"
                         ),
+                    };
+                    // Sprint 4.5: surface this call to the chat panel
+                    // even if it failed — users want to see the attempt,
+                    // not just the success.
+                    if let Some(handle) = app_handle.as_ref() {
+                        let event = make_call_event(&role.id, name, args, &body, now_ms());
+                        if let Err(e) = handle.emit(MCP_CALL_EVENT, &event) {
+                            tracing::warn!(
+                                target: "aidock::agent",
+                                role = %role.id,
+                                error = %e,
+                                "failed to emit MCP call event"
+                            );
+                        }
                     }
+                    body
                 } else {
                     // Protocol message tool (BROADCAST, ASK_AGENT, ANSWER,
                     // WORK_START, PROGRESS, DONE, SUMMARY).

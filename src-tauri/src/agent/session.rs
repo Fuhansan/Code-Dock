@@ -117,6 +117,9 @@ impl Session {
         api_key: String,
         app_handle: Option<tauri::AppHandle>,
     ) -> Result<Self, SessionError> {
+        // Clone before move-into-dispatcher so we can also hand it to
+        // each agent runtime for MCP call-event emission (Sprint 4.5).
+        let app_handle_for_agents = app_handle.clone();
         let mut dispatcher = Dispatcher::new(session_dir.clone(), app_handle).await?;
         let loaded: Vec<AgentMessage> = dispatcher.take_loaded_messages();
         let handle = dispatcher.handle();
@@ -180,6 +183,7 @@ impl Session {
                 initial_scratchpad,
                 scratchpad_path,
                 mcp: mcp.clone(),
+                app_handle: app_handle_for_agents.clone(),
             };
             agent_tasks.push(spawn_agent(boot));
         }

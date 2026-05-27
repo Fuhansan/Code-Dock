@@ -3,17 +3,34 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     MESSAGE_EVENT,
+    MCP_CALL_EVENT,
     startSession,
     sendUserMessage,
     sessionStatus,
     loadMessageHistory,
     type AgentMessage,
-    type AgentMessageKind
+    type AgentMessageKind,
+    type McpCallEvent
   } from '$lib/ipc';
+
+  type TimelineItem =
+    | { kind: 'message'; ts: number; data: AgentMessage }
+    | { kind: 'mcp'; ts: number; data: McpCallEvent };
 
   // ---- Sprint 2: multi-agent group chat ----
 
-  let messages = $state<AgentMessage[]>([]);
+  // Sprint 4.5: unified timeline. AgentMessages and McpCallEvents both
+  // land here, sorted by their backend timestamp so the user sees the
+  // chat in causal order even when MCP events arrive between messages.
+  let timeline = $state<TimelineItem[]>([]);
+  // Derived "messages only" view for backward-compat checks (empty test,
+  // input enabled, etc.).
+  let messages = $derived(timeline.filter((i) => i.kind === 'message') as Array<{
+    kind: 'message';
+    ts: number;
+    data: AgentMessage;
+  }>);
+
   let input = $state('');
   let sending = $state(false);
   let bootError = $state<string | null>(null);
@@ -26,7 +43,18 @@
   let topicTitles = $state<Record<string, string>>({});
 
   let scrollRef = $state<HTMLDivElement | null>(null);
-  let unlistenFn: UnlistenFn | null = null;
+  let unlistenMsg: UnlistenFn | null = null;
+  let unlistenMcp: UnlistenFn | null = null;
+
+  function insertItem(item: TimelineItem) {
+    // Append-and-sort. Sort is stable + cheap for the message volumes V0.1
+    // sees, and prevents reordering when events arrive in slightly
+    // surprising orders (an MCP call dispatched before its surrounding
+    // BROADCAST emit, etc).
+    const next = [...timeline, item];
+    next.sort((a, b) => a.ts - b.ts);
+    timeline = next;
+  }
 
   // Per-sender styling. Keys are role ids; unknown senders fall back.
   const SENDER_STYLES: Record<string, { label: string; color: string }> = {
@@ -50,12 +78,15 @@
     // immediately after a restart, before any live events arrive.
     try {
       const history = await loadMessageHistory();
+      const initial: TimelineItem[] = [];
       for (const m of history) {
         if (m.opens_topic_title && !topicTitles[m.topic_id]) {
           topicTitles[m.topic_id] = m.opens_topic_title;
         }
+        initial.push({ kind: 'message', ts: m.timestamp, data: m });
       }
-      messages = history;
+      initial.sort((a, b) => a.ts - b.ts);
+      timeline = initial;
       await scrollToBottom();
     } catch (e) {
       // Non-fatal — fresh session simply returns []. A real load error
@@ -66,13 +97,18 @@
     // Subscribe BEFORE start_session so we don't miss any events the
     // dispatcher emits during agent spin-up.
     try {
-      unlistenFn = await listen<AgentMessage>(MESSAGE_EVENT, async (event) => {
+      unlistenMsg = await listen<AgentMessage>(MESSAGE_EVENT, async (event) => {
         const m = event.payload;
-        // Record topic title if this message declares one.
         if (m.opens_topic_title && !topicTitles[m.topic_id]) {
           topicTitles = { ...topicTitles, [m.topic_id]: m.opens_topic_title };
         }
-        messages = [...messages, m];
+        insertItem({ kind: 'message', ts: m.timestamp, data: m });
+        await scrollToBottom();
+      });
+      // Sprint 4.5: MCP tool calls flow on a separate Tauri event.
+      unlistenMcp = await listen<McpCallEvent>(MCP_CALL_EVENT, async (event) => {
+        const e = event.payload;
+        insertItem({ kind: 'mcp', ts: e.timestamp, data: e });
         await scrollToBottom();
       });
     } catch (e) {
@@ -91,7 +127,8 @@
   });
 
   onDestroy(() => {
-    if (unlistenFn) unlistenFn();
+    if (unlistenMsg) unlistenMsg();
+    if (unlistenMcp) unlistenMcp();
   });
 
   async function handleSend() {
@@ -167,19 +204,33 @@
   {/if}
 
   <div class="chat-area" bind:this={scrollRef}>
-    {#if messages.length === 0 && ready}
+    {#if timeline.length === 0 && ready}
       <div class="empty">
         <p>多 Agent 工作室已就绪</p>
         <p class="muted">默认成员：PM、前端、后端 · 输入一条需求开始</p>
       </div>
     {/if}
 
-    {#each messages as msg (msg.id)}
-      {@const s = styleFor(msg.sender)}
-      {@const isUser = msg.sender === 'user'}
-      {@const info = isInfoOnly(msg.kind)}
+    {#each timeline as item (item.kind === 'message' ? item.data.id : item.data.id)}
+      {#if item.kind === 'mcp'}
+        {@const e = item.data}
+        {@const s = styleFor(e.agent)}
+        <div class="mcp-card" class:err={!e.success} style:--accent={s.color}>
+          <div class="mcp-head">
+            <span class="mcp-tool">🔧 {e.tool}</span>
+            <span class="mcp-agent" style:color={s.color}>{s.label}</span>
+            {#if !e.success}<span class="mcp-badge">ERR</span>{/if}
+          </div>
+          <div class="mcp-args">{e.args_preview}</div>
+          <div class="mcp-result">{e.result_preview}</div>
+        </div>
+      {:else}
+        {@const msg = item.data}
+        {@const s = styleFor(msg.sender)}
+        {@const isUser = msg.sender === 'user'}
+        {@const info = isInfoOnly(msg.kind)}
 
-      {#if msg.kind.type === 'SUMMARY'}
+        {#if msg.kind.type === 'SUMMARY'}
         {@const summaryTopicId = msg.kind.topic_id}
         {@const summaryTopicTitle = topicTitles[summaryTopicId]}
         <div class="divider">
@@ -206,21 +257,22 @@
           <span class="info-tag">{kindTag(msg.kind)}</span>
           <span class="info-text">{primaryText(msg.kind)}</span>
         </div>
-      {:else}
-        <div class="bubble" class:user={isUser}>
-          <div class="role-label" style:color={s.color}>
-            <span>{s.label}</span>
-            {#if msg.kind.type === 'ASK_AGENT'}
-              <span class="arrow">→ {styleFor(msg.kind.to).label}</span>
-            {:else if msg.kind.type === 'ANSWER'}
-              <span class="arrow">↩ 回复</span>
-            {/if}
-            <span class="kind-tag">{kindTag(msg.kind)}</span>
+        {:else}
+          <div class="bubble" class:user={isUser}>
+            <div class="role-label" style:color={s.color}>
+              <span>{s.label}</span>
+              {#if msg.kind.type === 'ASK_AGENT'}
+                <span class="arrow">→ {styleFor(msg.kind.to).label}</span>
+              {:else if msg.kind.type === 'ANSWER'}
+                <span class="arrow">↩ 回复</span>
+              {/if}
+              <span class="kind-tag">{kindTag(msg.kind)}</span>
+            </div>
+            <div class="content" style:--accent={s.color}>
+              {primaryText(msg.kind)}
+            </div>
           </div>
-          <div class="content" style:--accent={s.color}>
-            {primaryText(msg.kind)}
-          </div>
-        </div>
+        {/if}
       {/if}
     {/each}
 
@@ -407,6 +459,60 @@
     font-weight: 500;
     color: #1c1c1e;
   }
+
+  /* Sprint 4.5 — MCP tool-call cards */
+  .mcp-card {
+    align-self: stretch;
+    border-left: 3px solid var(--accent, #c7c7cc);
+    background: #f9f9fb;
+    border-radius: 0 8px 8px 0;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.4;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-left: 4px;
+  }
+  .mcp-card.err {
+    background: #fff7f6;
+    border-left-color: #ff3b30;
+  }
+  .mcp-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .mcp-tool {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .mcp-agent {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .mcp-badge {
+    font-size: 10px;
+    background: #ff3b30;
+    color: #fff;
+    padding: 1px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.04em;
+  }
+  .mcp-args,
+  .mcp-result {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    color: #6e6e73;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .mcp-result {
+    color: #1c1c1e;
+  }
   .decisions {
     margin: 4px 0 0 0;
     padding-left: 18px;
@@ -507,6 +613,21 @@
     }
     .divider-text {
       color: #98989d;
+    }
+    .mcp-card {
+      background: #1c1c1e;
+    }
+    .mcp-card.err {
+      background: #3a1f1d;
+    }
+    .mcp-args {
+      color: #8e8e93;
+    }
+    .mcp-result {
+      color: #d1d1d6;
+    }
+    .topic-title {
+      color: #f5f5f7;
     }
   }
 </style>

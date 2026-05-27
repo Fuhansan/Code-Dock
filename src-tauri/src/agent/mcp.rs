@@ -25,6 +25,7 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -36,6 +37,72 @@ use crate::llm::Tool as LlmTool;
 /// tool names and gives the runtime a cheap way to detect "is this an
 /// MCP tool?" without a registry lookup.
 pub const MCP_TOOL_PREFIX: &str = "fs__";
+
+/// Tauri event name the frontend subscribes to for live MCP tool call
+/// visibility (Sprint 4.5). Emitted from the agent runtime, one event per
+/// executed MCP tool call.
+pub const MCP_CALL_EVENT: &str = "aidock:mcp_call";
+
+/// What the front-end sees for one MCP tool execution. Lightweight by
+/// design — args / result are truncated previews, full audit lives in
+/// tracing logs.
+#[derive(Clone, Debug, Serialize)]
+pub struct McpCallEvent {
+    /// Stable id for de-duplication on the frontend if needed.
+    pub id: String,
+    /// Unix milliseconds, same clock as AgentMessage timestamps so a
+    /// merged timeline sorts cleanly.
+    pub timestamp: i64,
+    /// Role id of the agent that issued the call.
+    pub agent: String,
+    /// Full LLM-side tool name (with `fs__` prefix).
+    pub tool: String,
+    /// Truncated argument JSON for display. Capped at PREVIEW_MAX chars.
+    pub args_preview: String,
+    /// Truncated result body for display. Capped at PREVIEW_MAX chars.
+    pub result_preview: String,
+    /// True iff the result didn't begin with "ERROR:".
+    pub success: bool,
+}
+
+/// Cap on args / result preview length. Long writes get a `…` ellipsis
+/// so the UI stays compact and the prompt-side render_tool_result still
+/// has the full text for the LLM.
+pub const MCP_PREVIEW_MAX: usize = 200;
+
+/// Build an event from a raw arg JSON + a result string. The runtime
+/// calls this immediately after a successful (or error-returned)
+/// `McpClient::call_tool` and emits via Tauri.
+pub fn make_call_event(
+    agent: &str,
+    tool: &str,
+    raw_args: &str,
+    result_body: &str,
+    timestamp: i64,
+) -> McpCallEvent {
+    let success = !result_body.trim_start().starts_with("ERROR:");
+    McpCallEvent {
+        id: format!("mcpc-{}", uuid::Uuid::new_v4()),
+        timestamp,
+        agent: agent.to_string(),
+        tool: tool.to_string(),
+        args_preview: truncate(raw_args, MCP_PREVIEW_MAX),
+        result_preview: truncate(result_body, MCP_PREVIEW_MAX),
+        success,
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    // `chars()` keeps us at code-point boundaries — `s[..max]` would
+    // panic on multibyte text (Chinese tool args, etc).
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
 
 /// Cheap async-shared MCP client handle. `Clone` is cheap (Arc), so the
 /// session distributes one to each agent runtime.
@@ -277,5 +344,47 @@ mod tests {
         let rendered = render_tool_result(&result);
         assert!(rendered.starts_with("ERROR:"));
         assert!(rendered.contains("path outside"));
+    }
+
+    #[test]
+    fn truncate_handles_multibyte() {
+        // Naive `&s[..n]` would panic mid-char on 中文; truncate must
+        // count chars (code points), not bytes.
+        let s = "用户名密码登录API契约前端后端开发实现";
+        let out = truncate(s, 4);
+        assert_eq!(out, "用户名密…");
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hi", 100), "hi");
+    }
+
+    #[test]
+    fn make_call_event_flags_error_results() {
+        let ev = make_call_event(
+            "frontend_dev",
+            "fs__write_file",
+            r#"{"path":"x"}"#,
+            "ERROR: not allowed",
+            123,
+        );
+        assert!(!ev.success);
+        assert_eq!(ev.agent, "frontend_dev");
+        assert_eq!(ev.tool, "fs__write_file");
+        assert_eq!(ev.timestamp, 123);
+    }
+
+    #[test]
+    fn make_call_event_success_default() {
+        let ev = make_call_event(
+            "backend_dev",
+            "fs__list_directory",
+            r#"{"path":"."}"#,
+            "[FILE] index.html",
+            456,
+        );
+        assert!(ev.success);
+        assert!(ev.id.starts_with("mcpc-"));
     }
 }

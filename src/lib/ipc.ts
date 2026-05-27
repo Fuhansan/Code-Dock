@@ -84,6 +84,27 @@ export function sendChatMessage(params: SendChatParams): Promise<ChatResponse> {
 /** Tauri event name the dispatcher emits for every routed message. */
 export const MESSAGE_EVENT = 'aidock:message';
 
+/** Tauri event name the agent runtime emits per executed MCP tool call
+ *  (Sprint 4.5). One event per call, success or error. */
+export const MCP_CALL_EVENT = 'aidock:mcp_call';
+
+/** Live MCP tool-call notification. Mirrors Rust `McpCallEvent`. */
+export interface McpCallEvent {
+  id: string;
+  /** Unix milliseconds, same clock as AgentMessage so timelines sort cleanly. */
+  timestamp: number;
+  /** Role id that issued the call. */
+  agent: string;
+  /** Full tool name including `fs__` prefix. */
+  tool: string;
+  /** Truncated JSON args (≤ ~200 chars, '…' suffix when over). */
+  args_preview: string;
+  /** Truncated result body. */
+  result_preview: string;
+  /** False iff the result began with "ERROR:". */
+  success: boolean;
+}
+
 /**
  * Typed kinds, mirroring `AgentMessageKind` on the Rust side. The wire tag
  * lives in `type` and uses SCREAMING_SNAKE_CASE.
