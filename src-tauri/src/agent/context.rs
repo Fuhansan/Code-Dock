@@ -281,13 +281,7 @@ mod tests {
     use crate::agent::roles::{pm_role, FRONTEND_ID, PM_ID};
 
     fn make(id: &str, sender: &str, topic: &str, kind: AgentMessageKind) -> AgentMessage {
-        AgentMessage {
-            id: id.into(),
-            sender: sender.into(),
-            topic_id: topic.into(),
-            timestamp: 0,
-            kind,
-        }
+        AgentMessage::new(id, sender, topic, 0, kind)
     }
 
     fn user_msg(id: &str, content: &str) -> AgentMessage {

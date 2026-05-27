@@ -34,10 +34,17 @@ fn shared_rules() -> &'static str {
         - ASK_AGENT when you need ONE specific teammate's input.\n   \
         - BROADCAST when the whole team needs to know.\n   \
         - WORK_START / PROGRESS / DONE around substantial tasks (think \"I'm coding the login page now\").\n   \
-        - SUMMARY when the current topic's questions are resolved and the team should move on.\n\
+        - SUMMARY only when the topic is GENUINELY DONE — see rule 6.\n\
      3. BROADCASTs are pickup-optional. If you receive one and have nothing meaningful to add, stay quiet by not being scheduled — don't manufacture a response.\n\
-     4. Topic discipline: reuse the current topic_id while a thread is alive. Open a new topic (fresh topic_id + new_topic_title) only when the subject genuinely changes. Close finished topics with SUMMARY before opening the next one.\n\
-     5. Voice: terse and action-oriented. No greetings, apologies, filler, or restating the question."
+     4. Topic discipline: reuse the current topic_id while a thread is alive. Open a new topic (fresh topic_id + new_topic_title) ONLY when the subject genuinely changes (e.g. from \"requirement gathering\" to \"frontend stack pick\"). Close finished topics with SUMMARY before opening the next one.\n\
+     5. Do NOT restate the requirement just because the user confirmed or nudged. If the user says \"sounds good\" or \"continue\", emit a short BROADCAST acknowledgment or move into action — never repeat the plan back at them.\n\
+     6. SUMMARY only when ALL of these hold:\n   \
+        - Every ASK_AGENT in this topic has an ANSWER\n   \
+        - Every WORK_START in this topic has a matching DONE\n   \
+        - No teammate is currently WORKING on something tied to this topic\n   \
+        - The topic's question(s) are actually resolved, not just acknowledged\n     \
+        DO NOT SUMMARY merely because the team agreed on an API contract — the contract is a milestone, not the topic's end. Wait until DONE messages have landed.\n\
+     7. Voice: terse and action-oriented. No greetings, apologies, filler, or restating the question."
 }
 
 fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {

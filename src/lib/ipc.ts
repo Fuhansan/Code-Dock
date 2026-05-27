@@ -106,6 +106,11 @@ export interface AgentMessage {
   /** Unix milliseconds. */
   timestamp: number;
   kind: AgentMessageKind;
+  /**
+   * Set on the message that opens a new topic. Sprint 2.6 — UI uses this
+   * to show a real heading for the topic instead of just its id.
+   */
+  opens_topic_title?: string | null;
 }
 
 /** Start the default workshop session (idempotent). */

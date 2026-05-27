@@ -29,6 +29,33 @@ pub struct AgentMessage {
     /// Unix milliseconds.
     pub timestamp: i64,
     pub kind: AgentMessageKind,
+    /// Iff this message opens a *new* topic, the human-readable title the
+    /// sender declared (via the tool's `new_topic_title` arg). The dispatcher
+    /// picks this up on first sighting of `topic_id` and stamps it on the
+    /// `Topic`. Subsequent messages in the same topic leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opens_topic_title: Option<String>,
+}
+
+impl AgentMessage {
+    /// Builder helper that defaults `opens_topic_title` to `None`. Keeps test
+    /// and runtime construction sites compact.
+    pub fn new(
+        id: impl Into<MessageId>,
+        sender: impl Into<AgentId>,
+        topic_id: impl Into<TopicId>,
+        timestamp: i64,
+        kind: AgentMessageKind,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            sender: sender.into(),
+            topic_id: topic_id.into(),
+            timestamp,
+            kind,
+            opens_topic_title: None,
+        }
+    }
 }
 
 /// The discriminated message payload. Tag-on-the-wire is `type`.
@@ -146,20 +173,40 @@ mod tests {
 
     #[test]
     fn wire_format_uses_screaming_snake_case() {
-        let m = AgentMessage {
-            id: "m-1".into(),
-            sender: "PM".into(),
-            topic_id: "t-1".into(),
-            timestamp: 0,
-            kind: AgentMessageKind::AskAgent {
+        let m = AgentMessage::new(
+            "m-1",
+            "PM",
+            "t-1",
+            0,
+            AgentMessageKind::AskAgent {
                 to: "frontend_dev".into(),
                 content: "x".into(),
                 expected_format: None,
             },
-        };
+        );
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["kind"]["type"], "ASK_AGENT");
         assert_eq!(v["kind"]["to"], "frontend_dev");
+        // opens_topic_title omitted when None
+        assert!(v.get("opens_topic_title").is_none());
+    }
+
+    #[test]
+    fn opens_topic_title_round_trips() {
+        let mut m = AgentMessage::new(
+            "m-1",
+            "PM",
+            "t-2",
+            0,
+            AgentMessageKind::Broadcast {
+                content: "kick off".into(),
+            },
+        );
+        m.opens_topic_title = Some("Frontend stack pick".into());
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["opens_topic_title"], "Frontend stack pick");
+        let back: AgentMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back.opens_topic_title.as_deref(), Some("Frontend stack pick"));
     }
 
     #[test]

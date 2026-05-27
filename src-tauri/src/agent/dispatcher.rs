@@ -29,6 +29,27 @@ use tokio::sync::mpsc;
 use crate::agent::message::{AgentId, AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::topic::{Topic, TopicStatus};
 
+/// Derive a fallback topic title from the first message in a topic, when the
+/// sender forgot to provide `opens_topic_title`. Takes a short prefix of the
+/// payload that's appropriate as a heading.
+fn derive_title_from_first_message(msg: &AgentMessage) -> Option<String> {
+    const MAX: usize = 60;
+    let raw: &str = match &msg.kind {
+        AgentMessageKind::UserInput { content } => content,
+        AgentMessageKind::Broadcast { content } => content,
+        AgentMessageKind::AskAgent { content, .. } => content,
+        AgentMessageKind::WorkStart { task } => task,
+        // SUMMARY / DONE / PROGRESS / ANSWER aren't first-message material.
+        _ => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned = trimmed.lines().next().unwrap_or(trimmed);
+    Some(cleaned.chars().take(MAX).collect())
+}
+
 /// Channel capacities chosen for V0.1's expected message rate. Bumping later
 /// is harmless — the producers all use `send` (back-pressure aware), not
 /// `try_send`.
@@ -230,17 +251,34 @@ impl Dispatcher {
     /// Mutate `self.topics` based on this message. Topic creation is implicit:
     /// the first time a `topic_id` is seen, we open it. SUMMARY closes it.
     fn update_topic(&mut self, msg: &AgentMessage) {
+        let is_new = !self.topics.contains_key(&msg.topic_id);
+        if is_new {
+            // Title source priority (Sprint 2.6):
+            //   1. The agent's explicit `opens_topic_title` on this message
+            //   2. The latest message's payload (only meaningful for the first
+            //      message of a topic — UserInput, Broadcast, ASK_AGENT, etc.)
+            //   3. Fallback to the topic_id itself (ugly but never undefined)
+            let title = msg
+                .opens_topic_title
+                .clone()
+                .or_else(|| derive_title_from_first_message(msg))
+                .unwrap_or_else(|| msg.topic_id.clone());
+            self.topics.insert(
+                msg.topic_id.clone(),
+                Topic::open(msg.topic_id.clone(), title, msg.timestamp),
+            );
+            tracing::info!(
+                target: "aidock::dispatcher",
+                topic = %msg.topic_id,
+                title = %self.topics[&msg.topic_id].title,
+                "topic opened"
+            );
+        }
+
         let topic = self
             .topics
-            .entry(msg.topic_id.clone())
-            .or_insert_with(|| {
-                // Title heuristic: if this is the first sighting and we don't
-                // have a better source, use the topic_id itself. Sprint 2.6
-                // surfaces `new_topic_title` from ParsedToolCall and feeds it
-                // here.
-                Topic::open(msg.topic_id.clone(), msg.topic_id.clone(), msg.timestamp)
-            });
-
+            .get_mut(&msg.topic_id)
+            .expect("just inserted above if missing");
         topic.add_participant(&msg.sender);
 
         if let AgentMessageKind::Summary {

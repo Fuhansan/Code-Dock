@@ -245,12 +245,17 @@ fn build_outgoing(role: &RoleConfig, parsed: ParsedToolCall, latest_topic: Optio
         .or_else(|| latest_topic.cloned())
         .unwrap_or_else(|| format!("t-{}", Uuid::new_v4()));
 
+    // Only carry the title if the agent claimed THIS message opens a topic.
+    // Sprint 2.6: dispatcher stamps the title on the Topic on first sighting.
+    let opens_topic_title = parsed.new_topic_title;
+
     AgentMessage {
         id: format!("m-{}", Uuid::new_v4()),
         sender: role.id.clone(),
         topic_id,
         timestamp: now_ms(),
         kind: parsed.kind,
+        opens_topic_title,
     }
 }
 
@@ -289,13 +294,13 @@ fn now_ms() -> i64 {
 /// Build an inbound message representing a user line. Exposed so the Tauri
 /// command can craft one without duplicating the wire details.
 pub fn user_input_message(content: String, topic_id: TopicId) -> AgentMessage {
-    AgentMessage {
-        id: format!("m-{}", Uuid::new_v4()),
-        sender: "user".to_string(),
+    AgentMessage::new(
+        format!("m-{}", Uuid::new_v4()),
+        "user",
         topic_id,
-        timestamp: now_ms(),
-        kind: AgentMessageKind::UserInput { content },
-    }
+        now_ms(),
+        AgentMessageKind::UserInput { content },
+    )
 }
 
 #[cfg(test)]
@@ -304,37 +309,42 @@ mod tests {
     use crate::agent::roles::{frontend_role, pm_role};
 
     fn ask(to: &str) -> AgentMessage {
-        AgentMessage {
-            id: "m-1".into(),
-            sender: "PM".into(),
-            topic_id: "t-1".into(),
-            timestamp: 0,
-            kind: AgentMessageKind::AskAgent {
+        AgentMessage::new(
+            "m-1",
+            "PM",
+            "t-1",
+            0,
+            AgentMessageKind::AskAgent {
                 to: to.into(),
                 content: "?".into(),
                 expected_format: None,
             },
-        }
+        )
     }
 
     fn user(content: &str) -> AgentMessage {
-        AgentMessage {
-            id: "m-u".into(),
-            sender: "user".into(),
-            topic_id: "t-1".into(),
-            timestamp: 0,
-            kind: AgentMessageKind::UserInput { content: content.into() },
-        }
+        AgentMessage::new(
+            "m-u",
+            "user",
+            "t-1",
+            0,
+            AgentMessageKind::UserInput {
+                content: content.into(),
+            },
+        )
     }
 
+    #[allow(dead_code)]
     fn broadcast(from: &str) -> AgentMessage {
-        AgentMessage {
-            id: "m-b".into(),
-            sender: from.into(),
-            topic_id: "t-1".into(),
-            timestamp: 0,
-            kind: AgentMessageKind::Broadcast { content: "hi".into() },
-        }
+        AgentMessage::new(
+            "m-b",
+            from,
+            "t-1",
+            0,
+            AgentMessageKind::Broadcast {
+                content: "hi".into(),
+            },
+        )
     }
 
     #[test]
@@ -367,15 +377,15 @@ mod tests {
     }
 
     fn broadcast_with_content(from: &str, content: &str) -> AgentMessage {
-        AgentMessage {
-            id: "m-b".into(),
-            sender: from.into(),
-            topic_id: "t-1".into(),
-            timestamp: 0,
-            kind: AgentMessageKind::Broadcast {
+        AgentMessage::new(
+            "m-b",
+            from,
+            "t-1",
+            0,
+            AgentMessageKind::Broadcast {
                 content: content.into(),
             },
-        }
+        )
     }
 
     #[test]
@@ -423,17 +433,17 @@ mod tests {
     #[test]
     fn outgoing_ask_transitions_to_waiting() {
         let mut state = AgentState::Idle;
-        let m = AgentMessage {
-            id: "m-out".into(),
-            sender: "PM".into(),
-            topic_id: "t-1".into(),
-            timestamp: 100,
-            kind: AgentMessageKind::AskAgent {
+        let m = AgentMessage::new(
+            "m-out",
+            "PM",
+            "t-1",
+            100,
+            AgentMessageKind::AskAgent {
                 to: "frontend_dev".into(),
                 content: "?".into(),
                 expected_format: None,
             },
-        };
+        );
         apply_outgoing_state_transition(&mut state, &m);
         match state {
             AgentState::WaitingAnswer { for_message, since } => {
@@ -447,23 +457,28 @@ mod tests {
     #[test]
     fn outgoing_work_start_then_done() {
         let mut state = AgentState::Idle;
-        let m1 = AgentMessage {
-            id: "m1".into(),
-            sender: "frontend_dev".into(),
-            topic_id: "t-1".into(),
-            timestamp: 1,
-            kind: AgentMessageKind::WorkStart { task: "build".into() },
-        };
+        let m1 = AgentMessage::new(
+            "m1",
+            "frontend_dev",
+            "t-1",
+            1,
+            AgentMessageKind::WorkStart {
+                task: "build".into(),
+            },
+        );
         apply_outgoing_state_transition(&mut state, &m1);
         assert!(state.is_working());
 
-        let m2 = AgentMessage {
-            id: "m2".into(),
-            sender: "frontend_dev".into(),
-            topic_id: "t-1".into(),
-            timestamp: 2,
-            kind: AgentMessageKind::Done { summary: "done".into(), artifact_id: None },
-        };
+        let m2 = AgentMessage::new(
+            "m2",
+            "frontend_dev",
+            "t-1",
+            2,
+            AgentMessageKind::Done {
+                summary: "done".into(),
+                artifact_id: None,
+            },
+        );
         apply_outgoing_state_transition(&mut state, &m2);
         assert!(state.is_idle());
     }
@@ -480,6 +495,7 @@ mod tests {
         assert_eq!(m.sender, "PM");
         assert_eq!(m.topic_id, "t-7");
         assert!(m.id.starts_with("m-"));
+        assert!(m.opens_topic_title.is_none());
     }
 
     #[test]
@@ -493,5 +509,26 @@ mod tests {
         let latest = "t-existing".to_string();
         let m = build_outgoing(&role, parsed, Some(&latest));
         assert_eq!(m.topic_id, "t-existing");
+    }
+
+    #[test]
+    fn outgoing_carries_new_topic_title() {
+        // When the model declares it's opening a new topic, the title must
+        // flow through to the AgentMessage so the dispatcher can stamp it
+        // on the Topic.
+        let role = pm_role();
+        let parsed = ParsedToolCall {
+            kind: AgentMessageKind::Broadcast {
+                content: "kicking off frontend stack discussion".into(),
+            },
+            topic_id: Some("t-9".into()),
+            new_topic_title: Some("Frontend stack pick".into()),
+        };
+        let m = build_outgoing(&role, parsed, None);
+        assert_eq!(m.topic_id, "t-9");
+        assert_eq!(
+            m.opens_topic_title.as_deref(),
+            Some("Frontend stack pick")
+        );
     }
 }

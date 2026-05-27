@@ -19,6 +19,11 @@
   let sendError = $state<string | null>(null);
   let ready = $state(false);
 
+  // Sprint 2.6: topic_id → human title. Populated as we see opens_topic_title
+  // on incoming messages. Used for SUMMARY divider headings + topic break
+  // labels in the stream.
+  let topicTitles = $state<Record<string, string>>({});
+
   let scrollRef = $state<HTMLDivElement | null>(null);
   let unlistenFn: UnlistenFn | null = null;
 
@@ -44,7 +49,12 @@
     // dispatcher emits during agent spin-up.
     try {
       unlistenFn = await listen<AgentMessage>(MESSAGE_EVENT, async (event) => {
-        messages = [...messages, event.payload];
+        const m = event.payload;
+        // Record topic title if this message declares one.
+        if (m.opens_topic_title && !topicTitles[m.topic_id]) {
+          topicTitles = { ...topicTitles, [m.topic_id]: m.opens_topic_title };
+        }
+        messages = [...messages, m];
         await scrollToBottom();
       });
     } catch (e) {
@@ -152,10 +162,15 @@
       {@const info = isInfoOnly(msg.kind)}
 
       {#if msg.kind.type === 'SUMMARY'}
+        {@const summaryTopicId = msg.kind.topic_id}
+        {@const summaryTopicTitle = topicTitles[summaryTopicId]}
         <div class="divider">
           <hr />
           <div class="divider-text">
             <span class="divider-label">SUMMARY</span>
+            {#if summaryTopicTitle}
+              <span class="topic-title">「{summaryTopicTitle}」</span>
+            {/if}
             <span>{primaryText(msg.kind)}</span>
             {#if decisionsOf(msg.kind).length > 0}
               <ul class="decisions">
@@ -369,6 +384,10 @@
     padding: 2px 8px;
     border-radius: 4px;
     letter-spacing: 0.06em;
+  }
+  .topic-title {
+    font-weight: 500;
+    color: #1c1c1e;
   }
   .decisions {
     margin: 4px 0 0 0;
