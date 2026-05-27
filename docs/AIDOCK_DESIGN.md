@@ -525,10 +525,16 @@ Agent 用 MCP 工具时聊天里显示 `🔧 read_file('...')` 之类气泡，�
 - 用户数据/代码/API Key 留本地，市场和交易在云端
 
 ### 12.2 客户端
-- **Tauri 2.x + Rust + React/Svelte**
-  - 推荐 Svelte 5 + Tailwind（包更小）
+- **Tauri 2.x + Rust + Svelte 5 + TypeScript**（已落地）
 - **关键 Rust crate**：tokio / reqwest / serde / rmcp (MCP) / keyring / fs2 / tracing
-- Anthropic API：直接 reqwest 调（官方 SDK 不成熟）
+- **LLM Provider 抽象**：`LLMProvider` trait（chat_completion / supports_tool_use / provider_id），V0.1 只实现阿里百炼，后续 Anthropic / OpenAI / 本地模型按需加
+  - **主 provider**：阿里百炼 (Bailian)，OpenAI 兼容端点 `https://dashscope.aliyuncs.com/compatible-mode/v1`
+  - **主模型族**：Qwen
+    - `qwen3-max-2026-01-23` — 旗舰推理（技术总监、调解员）
+    - `qwen3.7-max` — 代码生成主力（前端 / 后端 / 移动端）
+    - `qwen3.6-plus` — 对话/平衡（老板、PM、UI、测试、DevOps；V0.1 三角色统一用此模型作 baseline）
+  - **非主推理模型**（角色可作为工具调用）：vision `qwen3-vl-plus` / 图像生成 `wan2.7-image-pro` / 视频 `happyhorse-1.0-t2v`
+- Tool use 协议：Bailian 用 OpenAI function calling 格式（不是 Anthropic 风格）。Sprint 1 末必须做 tool use 稳定性测试，确认 Qwen 输出结构化 JSON 的可靠性，Sprint 2 多 Agent 机制依赖此。
 
 ### 12.3 云端
 - **Next.js + Supabase**（Auth/Postgres/Storage 一站式）
@@ -575,7 +581,7 @@ Agent 用 MCP 工具时聊天里显示 `🔧 read_file('...')` 之类气泡，�
 | Sprint | 时长 | 范围 |
 |---|---|---|
 | **Sprint 0** | 1 周 | 脚手架：Tauri 项目初始化 + 三栏布局壳 + IPC 通信 |
-| **Sprint 1** | 1-2 周 | 单 Agent 端到端闭环：BYOK + Anthropic API + 单对单聊天 |
+| **Sprint 1** | 1-2 周 | 单 Agent 端到端闭环：BYOK + Bailian (Qwen) API + 单对单聊天 + tool use 稳定性测试 |
 | **Sprint 2** ⚠️ 最难 | **4 周** | 多 Agent runtime + 上下文核心机制（类型化消息、状态机、路由、并发、3 角色、ASK_AGENT 接力、Topic、SUMMARY 自动生成、Level 0 上下文构造器、recall/search tool、Agent 工作台） |
 | **Sprint 3** | 1-2 周 | 持久化：messages.jsonl + state.json 原子读写 + 重启恢复 |
 | **Sprint 4** | 2 周 | MCP 集成 + filesystem server + 工具调用 UI + 危险操作审批 |

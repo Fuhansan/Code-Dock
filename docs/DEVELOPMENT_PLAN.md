@@ -114,29 +114,45 @@
 
 > **目标**：能像 Claude.ai 一样跟 Claude 对话。**没有多 Agent，没有工作室概念，就是个聊天工具**。
 
-### S1.W2 — LLM 接入 + BYOK
+### S1.W2 — LLM 接入 + BYOK（**已切换到阿里百炼 / Qwen**）
 
 #### Rust 侧
 
-- [ ] `src-tauri/src/llm/anthropic.rs`：用 reqwest 封 Anthropic messages API
-  - 支持 system / messages / tools 参数
-  - 返回结构化 `LLMResponse { content, tool_uses, stop_reason }`
+- [ ] `src-tauri/src/llm/mod.rs`：定义 `LLMProvider` trait
+  - `async fn chat_completion(&self, req: ChatRequest) -> Result<LLMResponse>`
+  - `fn supports_tool_use() -> bool`
+  - `fn provider_id() -> &'static str`
+- [ ] `src-tauri/src/llm/bailian.rs`：阿里百炼 OpenAI 兼容端点实现
+  - Endpoint: `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+  - 默认模型 `qwen3.6-plus`，按 role config 可切 `qwen3-max-2026-01-23` / `qwen3.7-max`
+  - Tool use 用 OpenAI function calling 格式（`tools` + `tool_choice` 字段）
+  - 返回 `LLMResponse { content, tool_calls, stop_reason }`
 - [ ] `src-tauri/src/keyring.rs`：用 keyring crate 存取 API Key
-  - `save_api_key(provider, key)`
-  - `load_api_key(provider) -> Option<String>`
-- [ ] Tauri commands 暴露：`save_api_key` / `send_message_to_llm`
+  - `save_api_key(provider: &str, key: &str)` — provider 当前只接受 "bailian"
+  - `load_api_key(provider: &str) -> Option<String>`
+- [ ] Tauri commands 暴露：`save_api_key` / `send_message_to_llm` / `provider_status`
 
 #### 前端侧
 
 - [ ] `ApiKeySetup.svelte`：首次启动检测无 key 时弹出设置页
-  - 输入 Anthropic API Key
-  - 调 `save_api_key` 保存
+  - V0.1 只放阿里百炼一个选项（dropdown 留口，后续加 Anthropic/OpenAI）
+  - 输入 Bailian API Key（提示用户去 [bailian.console.aliyun.com](https://bailian.console.aliyun.com) 拿）
+  - 调 `save_api_key("bailian", key)` 保存
 - [ ] `ChatPanel.svelte`：输入框 + 消息列表（最简单的 user/assistant 气泡）
+
+#### Sprint 1 末必做：Tool use 稳定性测试
+
+- [ ] 写一个 dev-only 脚本/Tauri command：用 `qwen3.6-plus` 跑 10 次结构化输出
+  - 测试要求模型按 schema 输出 `{type, content, topic_id, ...}`
+  - 统计：成功率 / JSON 解析失败率 / schema 偏差率
+- [ ] 同样用 `qwen3-max-2026-01-23` 跑一次对比
+- [ ] **判断点**：成功率 < 90% → Sprint 2 多 Agent 机制有重大风险，需先调 prompt / 换模型 / 评估方向
 
 **【验收】**：
 - ✅ 首次打开应用，引导设置 API Key
-- ✅ 设置完成后能跟 Claude 对话，消息一来一回
+- ✅ 设置完成后能跟 Qwen 对话，消息一来一回
 - ✅ 重启应用，API Key 还在（keyring 持久化生效）
+- ✅ Tool use 稳定性测试报告产出，决定是否进 Sprint 2
 
 ### S1.W3 — 消息持久化（提前做一点 Sprint 3 的）
 
