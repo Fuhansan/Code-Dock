@@ -14,8 +14,11 @@
 //! ```
 
 mod commands;
-mod keyring_store;
-mod llm;
+// `keyring_store` and `llm` are `pub` so dev tools under `examples/` (e.g.
+// the Sprint 1 tool-use stability harness) can reuse them. The Tauri command
+// surface stays private — frontend talks through `commands` only.
+pub mod keyring_store;
+pub mod llm;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
