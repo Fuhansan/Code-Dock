@@ -19,6 +19,7 @@ pub mod recall;
 pub mod role;
 pub mod roles;
 pub mod runtime;
+pub mod scratchpad;
 pub mod session;
 pub mod state;
 pub mod topic;

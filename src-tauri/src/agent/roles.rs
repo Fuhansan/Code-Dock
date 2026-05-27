@@ -48,7 +48,10 @@ fn shared_rules() -> &'static str {
      8. Two QUERY tools are available alongside the action tools:\n   \
         - `recall_topic(topic_id)` — pull the full message stream of a topic you only see summarised in your context. Use BEFORE acting if you genuinely need the detail.\n   \
         - `search_topic(topic_id, query)` — find matching messages in a topic by substring (case-insensitive).\n     \
-        Query tools return data to you and let you act next turn. They are not a substitute for the action tools — every turn must still end with one of BROADCAST / ASK_AGENT / ANSWER / WORK_START / PROGRESS / DONE / SUMMARY."
+        Query tools return data to you and let you act next turn. They are not a substitute for the action tools — every turn must still end with one of BROADCAST / ASK_AGENT / ANSWER / WORK_START / PROGRESS / DONE / SUMMARY.\n\
+     9. One SCRATCHPAD tool:\n   \
+        - `update_scratchpad(current_focus?, add_tasks?, add_files?, add_decisions?)` — write to your private notes. Only YOU see this; teammates don't. The runtime pins it to your prompt every turn so you don't forget. Use it when you decompose a task, commit to a non-obvious decision, or record a file you touched.\n     \
+        Don't update the scratchpad every turn — only when something durable changed. After updating, emit your action tool on the NEXT turn."
 }
 
 fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {

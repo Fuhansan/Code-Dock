@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::role::RoleConfig;
+use crate::agent::scratchpad::{render_for_prompt as render_scratchpad, Scratchpad};
 use crate::llm::ChatMessage;
 
 /// Most recent N messages from the current topic to inline. V0.1's
@@ -46,6 +47,7 @@ pub fn build_level_0_context(
     role: &RoleConfig,
     history: &[AgentMessage],
     triggering: &AgentMessage,
+    scratchpad: &Scratchpad,
 ) -> Vec<ChatMessage> {
     let current_topic = triggering.topic_id.clone();
 
@@ -77,6 +79,14 @@ pub fn build_level_0_context(
 
     let mut system = String::with_capacity(role.system_prompt.len() + 1024);
     system.push_str(&role.system_prompt);
+
+    // Scratchpad (Sprint 2.8) — pinned immediately under the role prompt so
+    // the agent's own breadcrumbs are as prominent as its identity.
+    let scratchpad_section = render_scratchpad(scratchpad);
+    if !scratchpad_section.is_empty() {
+        system.push_str("\n\n---\n");
+        system.push_str(&scratchpad_section);
+    }
 
     let closed_section = format_closed_topics(
         &topic_first_seen_order,
@@ -252,6 +262,11 @@ fn message_mentions_me(role_id: &str, m: &AgentMessage) -> bool {
 mod tests {
     use super::*;
     use crate::agent::roles::{pm_role, FRONTEND_ID, PM_ID};
+    use crate::agent::scratchpad::apply_update;
+
+    fn empty_pad() -> Scratchpad {
+        Scratchpad::default()
+    }
 
     fn make(id: &str, sender: &str, topic: &str, kind: AgentMessageKind) -> AgentMessage {
         AgentMessage::new(id, sender, topic, 0, kind)
@@ -269,7 +284,7 @@ mod tests {
     #[test]
     fn empty_history_gives_system_plus_user() {
         let trig = user_msg("m-1", "build a todo app");
-        let chat = build_level_0_context(&pm_role(), &[], &trig);
+        let chat = build_level_0_context(&pm_role(), &[], &trig, &empty_pad());
         assert_eq!(chat.len(), 2);
         match &chat[0] {
             ChatMessage::System { content } => assert!(content.contains(PM_ID)),
@@ -288,7 +303,6 @@ mod tests {
     #[test]
     fn closed_topic_appears_in_system_with_summary_and_decisions() {
         let trig = user_msg("m-now", "what's next");
-        // history: one closed topic + a fresh trigger
         let history = vec![
             make(
                 "m-old-1",
@@ -309,7 +323,7 @@ mod tests {
                 },
             ),
         ];
-        let chat = build_level_0_context(&pm_role(), &history, &trig);
+        let chat = build_level_0_context(&pm_role(), &history, &trig, &empty_pad());
         let ChatMessage::System { content } = &chat[0] else {
             panic!()
         };
@@ -322,23 +336,18 @@ mod tests {
 
     #[test]
     fn current_topic_is_NOT_listed_as_closed() {
-        // Edge case: the agent's current turn is itself in a topic that
-        // somehow already has a SUMMARY in history. Don't put it in the
-        // closed-topic index (that'd be confusing).
         let trig = user_msg("m-now", "continue");
-        let history = vec![
-            make(
-                "m-1",
-                PM_ID,
-                "t-default",
-                AgentMessageKind::Summary {
-                    topic_id: "t-default".into(),
-                    summary: "x".into(),
-                    key_decisions: vec![],
-                },
-            ),
-        ];
-        let chat = build_level_0_context(&pm_role(), &history, &trig);
+        let history = vec![make(
+            "m-1",
+            PM_ID,
+            "t-default",
+            AgentMessageKind::Summary {
+                topic_id: "t-default".into(),
+                summary: "x".into(),
+                key_decisions: vec![],
+            },
+        )];
+        let chat = build_level_0_context(&pm_role(), &history, &trig, &empty_pad());
         let ChatMessage::System { content } = &chat[0] else {
             panic!()
         };
@@ -362,7 +371,7 @@ mod tests {
             },
         )];
         let role = crate::agent::roles::frontend_role();
-        let chat = build_level_0_context(&role, &history, &trig);
+        let chat = build_level_0_context(&role, &history, &trig, &empty_pad());
         let ChatMessage::System { content } = &chat[0] else {
             panic!()
         };
@@ -403,17 +412,13 @@ mod tests {
                 },
             ),
         ];
-        let chat = build_level_0_context(&pm_role(), &history, &trig);
+        let chat = build_level_0_context(&pm_role(), &history, &trig, &empty_pad());
         let ChatMessage::User { content } = &chat[1] else {
             panic!()
         };
-        // Non-triggering ids appear exactly once (in the topic stream).
         for id in ["m-1", "m-2"] {
             assert_eq!(content.matches(id).count(), 1, "id {id} should appear once");
         }
-        // The triggering id appears twice: once in the stream, once in the
-        // trailing "you must respond to [...]" pointer. That dual reference
-        // is intentional — the pointer is the cue for the model.
         assert_eq!(content.matches("m-3").count(), 2);
     }
 
@@ -449,12 +454,10 @@ mod tests {
                 },
             ),
         ];
-        let chat = build_level_0_context(&pm_role(), &history, &trig);
+        let chat = build_level_0_context(&pm_role(), &history, &trig, &empty_pad());
         let ChatMessage::User { content } = &chat[1] else {
             panic!()
         };
-        // Make sure reply_to is visible — that's what lets the LLM know the
-        // ASK was already answered (the bug fix from Sprint 2.4).
         assert!(content.contains("(re m-1)"));
     }
 
@@ -466,8 +469,6 @@ mod tests {
             "t-1",
             AgentMessageKind::UserInput { content: "go".into() },
         );
-        // Generate 2 * MAX messages in the topic; expect only the last MAX
-        // to be inlined.
         let mut history = Vec::new();
         for i in 0..(MAX_CURRENT_TOPIC_MESSAGES * 2) {
             history.push(make(
@@ -479,14 +480,45 @@ mod tests {
                 },
             ));
         }
-        let chat = build_level_0_context(&pm_role(), &history, &trig);
+        let chat = build_level_0_context(&pm_role(), &history, &trig, &empty_pad());
         let ChatMessage::User { content } = &chat[1] else {
             panic!()
         };
-        // Earliest message id should NOT appear.
         assert!(!content.contains("m-0 "));
-        // Newest message id from the history WINDOW should appear.
         let newest = MAX_CURRENT_TOPIC_MESSAGES * 2 - 1;
         assert!(content.contains(&format!("m-{newest}")));
+    }
+
+    #[test]
+    fn scratchpad_renders_into_system_prompt() {
+        // Sprint 2.8: when the agent has anything in its scratchpad, that
+        // content must appear in the system prompt so the agent sees its
+        // own breadcrumbs every turn.
+        let trig = user_msg("m-1", "continue work");
+        let mut pad = Scratchpad::default();
+        apply_update(
+            &mut pad,
+            r#"{"current_focus":"login page","add_decisions":["use JWT in localStorage"]}"#,
+        )
+        .unwrap();
+        let chat = build_level_0_context(&pm_role(), &[], &trig, &pad);
+        let ChatMessage::System { content } = &chat[0] else {
+            panic!()
+        };
+        assert!(content.contains("Your scratchpad"));
+        assert!(content.contains("Current focus: login page"));
+        assert!(content.contains("use JWT in localStorage"));
+        // Role identity still present — scratchpad augments, doesn't replace.
+        assert!(content.contains(PM_ID));
+    }
+
+    #[test]
+    fn empty_scratchpad_omits_section_entirely() {
+        let trig = user_msg("m-1", "go");
+        let chat = build_level_0_context(&pm_role(), &[], &trig, &empty_pad());
+        let ChatMessage::System { content } = &chat[0] else {
+            panic!()
+        };
+        assert!(!content.contains("Your scratchpad"));
     }
 }

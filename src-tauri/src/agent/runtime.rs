@@ -41,22 +41,32 @@ use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
 use crate::agent::role::RoleConfig;
 use crate::agent::roles::PM_ID;
+use crate::agent::scratchpad::{
+    apply_update as apply_scratchpad_update, is_scratchpad_tool, scratchpad_tools, Scratchpad,
+};
 use crate::agent::state::AgentState;
 use crate::llm::bailian::BailianProvider;
 use crate::llm::{ChatMessage, ChatRequest, LLMProvider, Tool};
 
-/// Cap on how many query→answer loops one agent turn may run. Above this we
-/// emit a warning and stop — protects against a model that keeps recalling
-/// without ever committing to an action tool.
+/// Cap on how many auxiliary→action loops one agent turn may run. Above
+/// this we emit a warning and stop — protects against a model that keeps
+/// recalling / scratchpad-updating without ever committing to an action.
 const MAX_QUERY_LOOP_ITERATIONS: usize = 3;
 
-/// Concatenation of action message tools (BROADCAST, ASK_AGENT, …) and
-/// query tools (recall_topic, search_topic). Advertised together on every
-/// LLM call.
+/// All tools advertised on every LLM call: action message tools + query
+/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8).
 fn all_tools() -> Vec<Tool> {
     let mut tools = message_tools();
     tools.extend(query_tools());
+    tools.extend(scratchpad_tools());
     tools
+}
+
+/// True iff this tool call DOES NOT end the agent's turn. Both query tools
+/// and `update_scratchpad` loop back to the LLM so the agent can act with
+/// the new info / breadcrumb in mind.
+fn is_auxiliary_tool(name: &str) -> bool {
+    is_query_tool(name) || is_scratchpad_tool(name)
 }
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
@@ -80,6 +90,9 @@ async fn run_agent(
     let provider = BailianProvider::new(api_key);
     let mut state = AgentState::Idle;
     let mut history: Vec<AgentMessage> = Vec::new();
+    // Sprint 2.8: the agent's private notes. Lives in-memory for this task's
+    // lifetime; Sprint 3 will serialise on session end.
+    let mut scratchpad = Scratchpad::default();
 
     while let Some(msg) = inbox_rx.recv().await {
         tracing::debug!(
@@ -122,8 +135,8 @@ async fn run_agent(
             continue;
         }
 
-        // Build the Level 0 context (Sprint 2.5).
-        let mut chat_messages = build_level_0_context(&role, &history, &msg);
+        // Build the Level 0 context (Sprint 2.5) + scratchpad (Sprint 2.8).
+        let mut chat_messages = build_level_0_context(&role, &history, &msg, &scratchpad);
 
         // Multi-turn LLM loop: query tools (Sprint 2.7) fetch data and feed
         // back into the conversation; we stop as soon as the model emits at
@@ -165,46 +178,49 @@ async fn run_agent(
                 break false;
             }
 
-            // Split the model's intent into queries vs actions.
-            let has_query = resp.tool_calls.iter().any(|tc| is_query_tool(&tc.function.name));
+            // Split the model's intent into auxiliaries (queries +
+            // scratchpad updates — they loop) vs actions (terminate the
+            // turn).
+            let has_aux = resp
+                .tool_calls
+                .iter()
+                .any(|tc| is_auxiliary_tool(&tc.function.name));
 
-            if has_query {
-                // Anchor the assistant turn that requested the queries, then
-                // append a tool-role message per executed query.
+            if has_aux {
+                // Anchor the assistant turn that requested the auxiliaries,
+                // then append a tool-role message per executed one.
                 chat_messages.push(ChatMessage::Assistant {
                     content: resp.content.clone(),
                     tool_calls: resp.tool_calls.clone(),
                 });
                 for tool_call in &resp.tool_calls {
-                    if !is_query_tool(&tool_call.function.name) {
-                        // The model mixed a query with an action this turn.
-                        // We tell the model so it doesn't think we silently
-                        // applied the action; it will get another shot next
-                        // iteration to re-emit the action with query results
-                        // in hand.
-                        chat_messages.push(ChatMessage::Tool {
-                            content: format!(
-                                "action tool '{}' was deferred — emit it again after reading the query results",
-                                tool_call.function.name
-                            ),
-                            tool_call_id: tool_call.id.clone(),
-                        });
-                        continue;
-                    }
-                    let body = execute_query_tool(
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                        &history,
-                    )
-                    .unwrap_or_else(|e| format!("query failed: {e}"));
-                    tracing::info!(
-                        target: "aidock::agent",
-                        role = %role.id,
-                        tool = %tool_call.function.name,
-                        iter,
-                        body_len = body.len(),
-                        "executed query tool"
-                    );
+                    let name = &tool_call.function.name;
+                    let args = &tool_call.function.arguments;
+                    let body = if is_query_tool(name) {
+                        execute_query_tool(name, args, &history)
+                            .unwrap_or_else(|e| format!("query failed: {e}"))
+                    } else if is_scratchpad_tool(name) {
+                        match apply_scratchpad_update(&mut scratchpad, args) {
+                            Ok(confirmation) => {
+                                tracing::info!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    iter,
+                                    "{}", confirmation
+                                );
+                                confirmation
+                            }
+                            Err(e) => format!("scratchpad update failed: {e}"),
+                        }
+                    } else {
+                        // The model mixed an action with auxiliaries this
+                        // turn. Tell it the action was deferred — it gets
+                        // another shot next iteration to re-emit.
+                        format!(
+                            "action tool '{}' was deferred — emit it again after the auxiliary tool results are in",
+                            name
+                        )
+                    };
                     chat_messages.push(ChatMessage::Tool {
                         content: body,
                         tool_call_id: tool_call.id.clone(),
@@ -214,7 +230,7 @@ async fn run_agent(
                     tracing::warn!(
                         target: "aidock::agent",
                         role = %role.id,
-                        "query-loop hit MAX_QUERY_LOOP_ITERATIONS without action — giving up this turn"
+                        "auxiliary-loop hit MAX_QUERY_LOOP_ITERATIONS without action — giving up this turn"
                     );
                     break false;
                 }
