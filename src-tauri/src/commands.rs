@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
+use crate::agent::message::AgentMessage;
+use crate::agent::persistence;
 use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
@@ -160,4 +162,23 @@ pub async fn send_user_message(
     let session = guard.as_ref().ok_or(CommandError::NoActiveSession)?;
     session.submit_user_input(content, topic_id).await?;
     Ok(())
+}
+
+/// Read the persisted message history for the default session. Sprint 3:
+/// front-end calls this on mount so reloaded sessions don't show an empty
+/// chat panel even though the backend remembers everything.
+///
+/// Returns the full stream in arrival order. Malformed lines (typically a
+/// crash-truncated tail) are skipped silently by the underlying reader.
+#[tauri::command]
+pub async fn load_message_history() -> Result<Vec<AgentMessage>, CommandError> {
+    let path = default_session_dir().join("messages.jsonl");
+    let msgs = persistence::read_jsonl_messages(&path).map_err(|e| {
+        // Roll the persistence error up as a generic LLM-ish string for
+        // the frontend. The real diagnosis is in the tracing logs.
+        CommandError::Llm(LLMError::Other(format!(
+            "could not load message history: {e}"
+        )))
+    })?;
+    Ok(msgs)
 }

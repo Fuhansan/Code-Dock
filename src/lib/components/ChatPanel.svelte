@@ -6,6 +6,7 @@
     startSession,
     sendUserMessage,
     sessionStatus,
+    loadMessageHistory,
     type AgentMessage,
     type AgentMessageKind
   } from '$lib/ipc';
@@ -45,6 +46,23 @@
   }
 
   onMount(async () => {
+    // Sprint 3: load persisted history FIRST so the user sees prior turns
+    // immediately after a restart, before any live events arrive.
+    try {
+      const history = await loadMessageHistory();
+      for (const m of history) {
+        if (m.opens_topic_title && !topicTitles[m.topic_id]) {
+          topicTitles[m.topic_id] = m.opens_topic_title;
+        }
+      }
+      messages = history;
+      await scrollToBottom();
+    } catch (e) {
+      // Non-fatal — fresh session simply returns []. A real load error
+      // surfaces here but shouldn't block subscribe + start.
+      console.warn('load history failed:', e);
+    }
+
     // Subscribe BEFORE start_session so we don't miss any events the
     // dispatcher emits during agent spin-up.
     try {

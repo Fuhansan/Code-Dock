@@ -130,3 +130,9 @@ export function sendUserMessage(content: string, topic_id?: string): Promise<voi
     topic_id: topic_id ?? null,
   });
 }
+
+/** Load the persisted message history for the default session.
+ *  Front-end calls this on mount so reloaded sessions show prior turns. */
+export function loadMessageHistory(): Promise<AgentMessage[]> {
+  return invoke('load_message_history');
+}
