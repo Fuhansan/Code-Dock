@@ -12,11 +12,15 @@
 //! - `scratchpad` — per-Agent working memory (Sprint 2.8)
 
 pub mod message;
+pub mod protocol;
 pub mod role;
+pub mod roles;
 pub mod state;
 pub mod topic;
 
 pub use message::{AgentId, AgentMessage, AgentMessageKind, MessageId, TopicId};
+pub use protocol::{message_tools, parse_tool_call, ParsedToolCall, ProtocolError};
 pub use role::{Budget, LoopMode, ModelConfig, RoleConfig};
+pub use roles::{default_workshop, role_by_id, BACKEND_ID, FRONTEND_ID, PM_ID};
 pub use state::AgentState;
 pub use topic::{Topic, TopicIndexEntry, TopicStatus};

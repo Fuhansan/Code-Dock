@@ -1,0 +1,276 @@
+//! V0.1 hardcoded workshop: PM + frontend_dev + backend_dev.
+//!
+//! Sprint 2 deliberately ships *one* workshop wired in code, so the
+//! multi-agent protocol can be validated without the Sprint 3 workshop
+//! editor on the critical path. Sprint 0.3 swaps this constant for a
+//! file-loaded workshop definition; the shape (`Vec<RoleConfig>`) is the
+//! same.
+//!
+//! The system prompts here are the single most important piece of
+//! Sprint 2 — they encode the protocol the LLM must follow. The Sprint 1
+//! stability harness verified the basic tool-call discipline; these prompts
+//! extend that with team awareness and topic discipline.
+
+use crate::agent::message::AgentId;
+use crate::agent::protocol::{
+    TOOL_ANSWER, TOOL_ASK_AGENT, TOOL_BROADCAST, TOOL_DONE, TOOL_PROGRESS, TOOL_SUMMARY,
+    TOOL_WORK_START,
+};
+use crate::agent::role::{Budget, LoopMode, ModelConfig, RoleConfig};
+
+pub const PM_ID: &str = "PM";
+pub const FRONTEND_ID: &str = "frontend_dev";
+pub const BACKEND_ID: &str = "backend_dev";
+
+/// The shared "house rules" all V0.1 roles share. Per AIDOCK_DESIGN.md the
+/// V0.1 baseline keeps every agent on the same model + temperature so a
+/// future multi-agent-vs-single-agent A/B isolates the multi-agent
+/// mechanism's contribution from any model-tier advantage.
+fn shared_rules() -> &'static str {
+    "## House rules\n\
+     1. Every turn, call EXACTLY ONE tool. Never plain text. Never multiple tool calls.\n\
+     2. Pick the right tool:\n   \
+        - ANSWER replies to an ASK_AGENT directed at you (use its message id as reply_to).\n   \
+        - ASK_AGENT when you need ONE specific teammate's input.\n   \
+        - BROADCAST when the whole team needs to know.\n   \
+        - WORK_START / PROGRESS / DONE around substantial tasks (think \"I'm coding the login page now\").\n   \
+        - SUMMARY when the current topic's questions are resolved and the team should move on.\n\
+     3. BROADCASTs are pickup-optional. If you receive one and have nothing meaningful to add, stay quiet by not being scheduled — don't manufacture a response.\n\
+     4. Topic discipline: reuse the current topic_id while a thread is alive. Open a new topic (fresh topic_id + new_topic_title) only when the subject genuinely changes. Close finished topics with SUMMARY before opening the next one.\n\
+     5. Voice: terse and action-oriented. No greetings, apologies, filler, or restating the question."
+}
+
+fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {
+    let mut s = String::from("## Team\n");
+    s.push_str(&format!("- {self_role} (YOU)\n"));
+    for t in teammates {
+        let desc = match *t {
+            PM_ID => "Product Manager — owns requirements and customer-facing conversations.",
+            FRONTEND_ID => "Frontend developer — implements the user interface.",
+            BACKEND_ID => "Backend developer — implements server-side logic and data.",
+            _ => "Teammate.",
+        };
+        s.push_str(&format!("- {t} — {desc}\n"));
+    }
+    s
+}
+
+fn baseline_model() -> ModelConfig {
+    ModelConfig {
+        provider: "bailian".into(),
+        primary: "qwen3.6-plus".into(),
+        fallback: None,
+        // Lower temperature than chat mode — we want deterministic
+        // tool-call discipline, not creative text.
+        temperature: 0.3,
+        max_tokens: 4096,
+        extended_thinking: false,
+    }
+}
+
+fn baseline_budget() -> Budget {
+    Budget {
+        per_call_tokens: 8000,
+        per_session_tokens: Some(400_000),
+        per_session_calls: Some(200),
+    }
+}
+
+fn all_message_tools() -> Vec<String> {
+    vec![
+        TOOL_BROADCAST.into(),
+        TOOL_ASK_AGENT.into(),
+        TOOL_ANSWER.into(),
+        TOOL_WORK_START.into(),
+        TOOL_PROGRESS.into(),
+        TOOL_DONE.into(),
+        TOOL_SUMMARY.into(),
+    ]
+}
+
+// ---------- PM ----------
+
+fn pm_system_prompt() -> String {
+    let team = shared_team_block(
+        "PM",
+        &[FRONTEND_ID, BACKEND_ID],
+    );
+    format!(
+        "You are the Product Manager (\"PM\") in AiDock, a multi-agent AI software team.\n\n\
+         Your job:\n\
+         - Talk to the customer (the human user) and understand what they want.\n\
+         - Translate that into actionable work for the engineers.\n\
+         - Coordinate the team and decide when to move on.\n\n\
+         {team}\n\
+         {rules}",
+        team = team,
+        rules = shared_rules(),
+    )
+}
+
+pub fn pm_role() -> RoleConfig {
+    RoleConfig {
+        id: PM_ID.into(),
+        display_name: "Product Manager".into(),
+        description: "Customer interface, requirements, coordination.".into(),
+        system_prompt: pm_system_prompt(),
+        model: baseline_model(),
+        budget: baseline_budget(),
+        tools: all_message_tools(),
+        teammates: vec![FRONTEND_ID.into(), BACKEND_ID.into()],
+        loop_mode: LoopMode::Single,
+        max_history_tokens: Some(32_000),
+    }
+}
+
+// ---------- frontend_dev ----------
+
+fn frontend_system_prompt() -> String {
+    let team = shared_team_block(
+        FRONTEND_ID,
+        &[PM_ID, BACKEND_ID],
+    );
+    format!(
+        "You are the frontend developer (\"frontend_dev\") in AiDock, a multi-agent AI software team.\n\n\
+         Your job:\n\
+         - Implement the user-facing interface based on the PM's requirements.\n\
+         - Coordinate with backend_dev on data shapes and API contracts.\n\
+         - Be honest about technical constraints when PM proposes something fragile.\n\n\
+         {team}\n\
+         {rules}",
+        team = team,
+        rules = shared_rules(),
+    )
+}
+
+pub fn frontend_role() -> RoleConfig {
+    RoleConfig {
+        id: FRONTEND_ID.into(),
+        display_name: "Frontend Developer".into(),
+        description: "Implements the user interface.".into(),
+        system_prompt: frontend_system_prompt(),
+        model: baseline_model(),
+        budget: baseline_budget(),
+        tools: all_message_tools(),
+        teammates: vec![PM_ID.into(), BACKEND_ID.into()],
+        loop_mode: LoopMode::Single,
+        max_history_tokens: Some(32_000),
+    }
+}
+
+// ---------- backend_dev ----------
+
+fn backend_system_prompt() -> String {
+    let team = shared_team_block(
+        BACKEND_ID,
+        &[PM_ID, FRONTEND_ID],
+    );
+    format!(
+        "You are the backend developer (\"backend_dev\") in AiDock, a multi-agent AI software team.\n\n\
+         Your job:\n\
+         - Implement server-side logic, data models, and APIs based on PM's requirements.\n\
+         - Coordinate with frontend_dev on API contracts before either side codes against them.\n\
+         - Be honest about technical constraints when PM proposes something fragile.\n\n\
+         {team}\n\
+         {rules}",
+        team = team,
+        rules = shared_rules(),
+    )
+}
+
+pub fn backend_role() -> RoleConfig {
+    RoleConfig {
+        id: BACKEND_ID.into(),
+        display_name: "Backend Developer".into(),
+        description: "Implements server logic and data.".into(),
+        system_prompt: backend_system_prompt(),
+        model: baseline_model(),
+        budget: baseline_budget(),
+        tools: all_message_tools(),
+        teammates: vec![PM_ID.into(), FRONTEND_ID.into()],
+        loop_mode: LoopMode::Single,
+        max_history_tokens: Some(32_000),
+    }
+}
+
+// ---------- Workshop assembly ----------
+
+/// The V0.1 hardcoded workshop: PM + frontend_dev + backend_dev.
+pub fn default_workshop() -> Vec<RoleConfig> {
+    vec![pm_role(), frontend_role(), backend_role()]
+}
+
+/// Look up a role by id in the default workshop.
+pub fn role_by_id(id: &AgentId) -> Option<RoleConfig> {
+    default_workshop().into_iter().find(|r| r.id == *id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_workshop_has_three_roles() {
+        let w = default_workshop();
+        assert_eq!(w.len(), 3);
+        let ids: Vec<&str> = w.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&PM_ID));
+        assert!(ids.contains(&FRONTEND_ID));
+        assert!(ids.contains(&BACKEND_ID));
+    }
+
+    #[test]
+    fn role_by_id_finds_each() {
+        assert!(role_by_id(&PM_ID.into()).is_some());
+        assert!(role_by_id(&FRONTEND_ID.into()).is_some());
+        assert!(role_by_id(&BACKEND_ID.into()).is_some());
+        assert!(role_by_id(&"nonexistent".into()).is_none());
+    }
+
+    #[test]
+    fn all_roles_share_baseline_model() {
+        for role in default_workshop() {
+            assert_eq!(role.model.provider, "bailian");
+            assert_eq!(role.model.primary, "qwen3.6-plus");
+            assert!(role.model.temperature < 0.5, "agent runs use low temp");
+        }
+    }
+
+    #[test]
+    fn each_role_lists_the_other_two_as_teammates() {
+        let pm = pm_role();
+        assert_eq!(pm.teammates.len(), 2);
+        assert!(pm.teammates.contains(&FRONTEND_ID.to_string()));
+        assert!(pm.teammates.contains(&BACKEND_ID.to_string()));
+
+        let fe = frontend_role();
+        assert!(fe.teammates.contains(&PM_ID.to_string()));
+        assert!(fe.teammates.contains(&BACKEND_ID.to_string()));
+    }
+
+    #[test]
+    fn system_prompts_mention_team_layout() {
+        // The team block is what teaches the model who else is in the chat.
+        // If this slips, agents will hallucinate teammate ids.
+        let pm = pm_role();
+        assert!(pm.system_prompt.contains(FRONTEND_ID));
+        assert!(pm.system_prompt.contains(BACKEND_ID));
+        assert!(pm.system_prompt.contains("YOU"));
+
+        let fe = frontend_role();
+        assert!(fe.system_prompt.contains(PM_ID));
+        assert!(fe.system_prompt.contains(BACKEND_ID));
+    }
+
+    #[test]
+    fn system_prompts_state_tool_discipline() {
+        for role in default_workshop() {
+            assert!(
+                role.system_prompt.contains("EXACTLY ONE tool"),
+                "every role must inherit the one-tool-per-turn rule"
+            );
+            assert!(role.system_prompt.contains("ASK_AGENT"));
+            assert!(role.system_prompt.contains("SUMMARY"));
+        }
+    }
+}
