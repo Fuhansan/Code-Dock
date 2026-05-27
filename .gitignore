@@ -1,0 +1,48 @@
+# ─── Rust ───
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# ─── Node ───
+node_modules/
+dist/
+dist-ssr/
+.pnpm-store/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Tauri ───
+src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/WixTools/
+src-tauri/gen/
+
+# ─── Editor / IDE ───
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Env / secrets ───
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ─── Build outputs ───
+*.dmg
+*.msi
+*.AppImage
+*.deb
+*.app
+
+# ─── Misc ───
+.cache/
+tmp/
+*.tmp
