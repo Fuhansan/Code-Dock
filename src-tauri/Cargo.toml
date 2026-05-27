@@ -22,3 +22,20 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "io-util", "time"] }
+
+# HTTP client for LLM provider calls
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Encrypted API key storage via OS keychain
+keyring = "3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

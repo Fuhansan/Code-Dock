@@ -1,14 +1,41 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+//! AiDock — self-assembled multi-agent AI workshop platform.
+//!
+//! Library crate. The binary in `main.rs` only calls `run()` after setting the
+//! Windows subsystem attribute. Module layout follows AIDOCK_DESIGN.md §12.2:
+//!
+//! ```text
+//! agent/        — Agent runtime, state machine, router (Sprint 2+)
+//! message/      — Typed messages, JSONL stream (Sprint 2+)
+//! llm/          — Provider trait + Bailian impl  ← Sprint 1
+//! mcp/          — MCP client (Sprint 4)
+//! storage/      — session_state + messages.jsonl (Sprint 3)
+//! keyring_store — API key persistence            ← Sprint 1
+//! commands      — Tauri IPC surface              ← Sprint 1
+//! ```
+
+mod commands;
+mod keyring_store;
+mod llm;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Structured logging. RUST_LOG controls verbosity; default to info for the
+    // aidock crate, warn elsewhere.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "aidock=info,warn".into()),
+        )
+        .init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            commands::greet,
+            commands::provider_status,
+            commands::save_api_key,
+            commands::send_chat_message,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

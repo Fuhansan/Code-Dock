@@ -1,19 +1,39 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { greet, providerStatus } from '$lib/ipc';
+  import ApiKeySetup from '$lib/components/ApiKeySetup.svelte';
+  import ChatPanel from '$lib/components/ChatPanel.svelte';
 
-  // Sprint 0 — static skeleton + minimal IPC health check.
-  // Real Agent/state/IPC wiring lands in Sprint 1+.
+  // Sprint 0 health dot + Sprint 1 BYOK gate + chat panel mount.
+
+  const PROVIDER = 'bailian';
+
   let backendOk = $state<boolean | null>(null);
+  let keyConfigured = $state<boolean | null>(null); // null = unknown, before first check
 
   onMount(async () => {
+    // Backend health (Sprint 0 contract)
     try {
-      const reply = await invoke<string>('greet', { name: 'Sprint0' });
+      const reply = await greet('init');
       backendOk = reply.length > 0;
     } catch {
       backendOk = false;
     }
+    // BYOK gate (Sprint 1 contract)
+    await refreshKeyStatus();
   });
+
+  async function refreshKeyStatus() {
+    try {
+      keyConfigured = await providerStatus(PROVIDER);
+    } catch {
+      keyConfigured = false;
+    }
+  }
+
+  function handleKeySaved() {
+    keyConfigured = true;
+  }
 </script>
 
 <div class="app">
@@ -60,16 +80,13 @@
   </aside>
 
   <main class="center">
-    <div class="chat-area">
-      <p class="placeholder">群聊主区将在 Sprint 1+ 接入<br />当前是 Sprint 0 骨架</p>
-    </div>
-    <div class="input-area">
-      <textarea
-        class="input"
-        placeholder="输入消息，用 @ 提及角色…（Sprint 1+ 启用）"
-        disabled
-      ></textarea>
-    </div>
+    {#if keyConfigured === null}
+      <div class="loading">正在加载…</div>
+    {:else if keyConfigured}
+      <ChatPanel />
+    {:else}
+      <div class="loading muted">请先配置 LLM Provider</div>
+    {/if}
   </main>
 
   <aside class="right">
@@ -89,6 +106,10 @@
     </section>
   </aside>
 </div>
+
+{#if keyConfigured === false}
+  <ApiKeySetup onSaved={handleKeySaved} />
+{/if}
 
 <style>
   :global(:root) {
@@ -226,37 +247,13 @@
     overflow: hidden;
   }
 
-  .chat-area {
-    flex: 1;
-    overflow-y: auto;
-    padding: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .input-area {
-    border-top: 1px solid #e5e5e7;
-    padding: 12px 16px;
-    background: #ffffff;
-  }
-
-  .input {
-    width: 100%;
-    min-height: 56px;
-    border: 1px solid #e5e5e7;
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-family: inherit;
+  .loading {
+    margin: auto;
+    color: #8e8e93;
     font-size: 14px;
-    resize: none;
-    outline: none;
-    background: #fafafa;
-    box-sizing: border-box;
   }
-  .input:disabled {
-    cursor: not-allowed;
-    color: #999;
+  .loading.muted {
+    opacity: 0.6;
   }
 
   .right {
@@ -308,15 +305,6 @@
     }
     .center {
       background: #2c2c2e;
-    }
-    .input-area {
-      background: #2c2c2e;
-      border-top-color: #38383a;
-    }
-    .input {
-      background: #1c1c1e;
-      border-color: #38383a;
-      color: #f5f5f7;
     }
     .icon-btn {
       color: #98989d;
