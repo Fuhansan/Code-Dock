@@ -34,11 +34,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(commands::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::provider_status,
             commands::save_api_key,
             commands::send_chat_message,
+            commands::start_session,
+            commands::session_status,
+            commands::send_user_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

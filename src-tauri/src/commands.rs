@@ -2,10 +2,14 @@
 //!
 //! Each `#[tauri::command]` here is callable from the Svelte side via
 //! `invoke("name", { ... })`. Keep this module thin — commands should be
-//! façades that delegate to `llm`, `keyring_store`, etc., not contain logic.
+//! façades that delegate to `llm`, `keyring_store`, `agent`, not contain logic.
+
+use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
+use tokio::sync::Mutex;
 
+use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
     bailian::BailianProvider, ChatMessage, ChatRequest, ChatResponse, LLMError, LLMProvider, Tool,
@@ -22,17 +26,32 @@ pub enum CommandError {
     #[error(transparent)]
     Keyring(#[from] KeyringError),
 
+    #[error(transparent)]
+    Session(#[from] SessionError),
+
     #[error("provider '{0}' is not configured — set its API key first")]
     ProviderNotConfigured(String),
 
     #[error("unknown provider '{0}' — supported providers: bailian")]
     UnknownProvider(String),
+
+    #[error("no active session — call start_session first")]
+    NoActiveSession,
 }
 
 impl serde::Serialize for CommandError {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_string())
     }
+}
+
+// ---------- AppState (managed by Tauri) ----------
+
+/// Process-wide state owned by Tauri's `.manage()`. V0.1 holds at most one
+/// running `Session`. Future versions extend this to a map keyed by session id.
+#[derive(Default)]
+pub struct AppState {
+    pub session: Mutex<Option<Session>>,
 }
 
 // ---------- Sprint 0 health check ----------
@@ -59,7 +78,7 @@ pub fn save_api_key(provider: String, key: String) -> Result<(), CommandError> {
     Ok(())
 }
 
-// ---------- LLM ----------
+// ---------- LLM (Sprint 1 single-agent path) ----------
 
 /// One chat completion round-trip against the chosen provider.
 ///
@@ -94,4 +113,51 @@ pub async fn send_chat_message(
     };
 
     Ok(resp)
+}
+
+// ---------- Multi-agent session (Sprint 2) ----------
+
+fn default_session_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".aidock").join("sessions").join("default")
+}
+
+/// Start the V0.1 default workshop session (PM + frontend_dev + backend_dev).
+/// Idempotent: calling on an already-started session is a no-op.
+#[tauri::command]
+pub async fn start_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let mut guard = state.session.lock().await;
+    if guard.is_some() {
+        tracing::debug!(target: "aidock::cmd", "start_session: already running");
+        return Ok(());
+    }
+    let key = keyring_store::load_api_key("bailian")?
+        .ok_or_else(|| CommandError::ProviderNotConfigured("bailian".to_string()))?;
+    let session = Session::start(default_session_dir(), key, app).await?;
+    *guard = Some(session);
+    tracing::info!(target: "aidock::cmd", "session started");
+    Ok(())
+}
+
+/// Whether a session is currently running.
+#[tauri::command]
+pub async fn session_status(state: tauri::State<'_, AppState>) -> Result<bool, CommandError> {
+    Ok(state.session.lock().await.is_some())
+}
+
+/// Push one user-originated message into the running session. Errors if no
+/// session has been started.
+#[tauri::command]
+pub async fn send_user_message(
+    content: String,
+    topic_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let guard = state.session.lock().await;
+    let session = guard.as_ref().ok_or(CommandError::NoActiveSession)?;
+    session.submit_user_input(content, topic_id).await?;
+    Ok(())
 }

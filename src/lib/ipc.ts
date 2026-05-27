@@ -78,3 +78,50 @@ export function sendChatMessage(params: SendChatParams): Promise<ChatResponse> {
     tool_choice: params.tool_choice ?? null,
   });
 }
+
+// ---------- Multi-agent session (Sprint 2) ----------
+
+/** Tauri event name the dispatcher emits for every routed message. */
+export const MESSAGE_EVENT = 'aidock:message';
+
+/**
+ * Typed kinds, mirroring `AgentMessageKind` on the Rust side. The wire tag
+ * lives in `type` and uses SCREAMING_SNAKE_CASE.
+ */
+export type AgentMessageKind =
+  | { type: 'BROADCAST'; content: string }
+  | { type: 'ASK_AGENT'; to: string; content: string; expected_format?: string | null }
+  | { type: 'ANSWER'; reply_to: string; content: string }
+  | { type: 'WORK_START'; task: string }
+  | { type: 'PROGRESS'; task: string; percent: number; note: string }
+  | { type: 'DONE'; summary: string; artifact_id?: string | null }
+  | { type: 'SUMMARY'; topic_id: string; summary: string; key_decisions: string[] }
+  | { type: 'USER_INPUT'; content: string };
+
+export interface AgentMessage {
+  id: string;
+  /** Role id of the sender, or `"user"` for human input. */
+  sender: string;
+  topic_id: string;
+  /** Unix milliseconds. */
+  timestamp: number;
+  kind: AgentMessageKind;
+}
+
+/** Start the default workshop session (idempotent). */
+export function startSession(): Promise<void> {
+  return invoke('start_session');
+}
+
+/** True iff a session is currently running. */
+export function sessionStatus(): Promise<boolean> {
+  return invoke('session_status');
+}
+
+/** Push one human-originated message into the session. */
+export function sendUserMessage(content: string, topic_id?: string): Promise<void> {
+  return invoke('send_user_message', {
+    content,
+    topic_id: topic_id ?? null,
+  });
+}
