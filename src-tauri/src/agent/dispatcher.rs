@@ -69,13 +69,17 @@ impl DispatcherHandle {
 /// `None`) and let the channel close once every external `DispatcherHandle`
 /// clone goes out of scope. Field-level partial move would block reborrowing
 /// `self` for `handle_message`.
+///
+/// `app_handle` is `Option` so dev/test harnesses (e.g. the multi-agent
+/// example) can run without Tauri. When `None`, message events are written
+/// to messages.jsonl and tracing but no IPC event is emitted.
 pub struct Dispatcher {
     inboxes: HashMap<AgentId, mpsc::Sender<AgentMessage>>,
     submit_tx: Option<mpsc::Sender<AgentMessage>>,
     submit_rx: mpsc::Receiver<AgentMessage>,
     messages_file: File,
     topics: HashMap<TopicId, Topic>,
-    app_handle: tauri::AppHandle,
+    app_handle: Option<tauri::AppHandle>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +97,10 @@ pub enum DispatcherError {
 impl Dispatcher {
     /// Open (or create) the session directory and prepare a new dispatcher.
     /// `messages.jsonl` is opened in append mode; old contents are preserved.
+    /// `app_handle` may be `None` for headless dev harnesses.
     pub async fn new(
         session_dir: PathBuf,
-        app_handle: tauri::AppHandle,
+        app_handle: Option<tauri::AppHandle>,
     ) -> Result<Self, DispatcherError> {
         tokio::fs::create_dir_all(&session_dir)
             .await
@@ -283,7 +288,10 @@ impl Dispatcher {
     }
 
     fn emit_event(&self, msg: &AgentMessage) {
-        if let Err(e) = self.app_handle.emit(MESSAGE_EVENT, msg) {
+        let Some(handle) = self.app_handle.as_ref() else {
+            return; // headless mode — JSONL + tracing are the only sinks
+        };
+        if let Err(e) = handle.emit(MESSAGE_EVENT, msg) {
             tracing::warn!(target: "aidock::dispatcher", error = %e, "failed to emit message event");
         }
     }

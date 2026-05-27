@@ -42,11 +42,11 @@ pub enum SessionError {
 impl Session {
     /// Build a Session: open the dispatcher, register every Agent in the
     /// default workshop, spawn each Agent's runtime task and the dispatcher
-    /// task.
+    /// task. Pass `None` for `app_handle` to run headless (dev harnesses).
     pub async fn start(
         session_dir: PathBuf,
         api_key: String,
-        app_handle: tauri::AppHandle,
+        app_handle: Option<tauri::AppHandle>,
     ) -> Result<Self, SessionError> {
         let mut dispatcher = Dispatcher::new(session_dir, app_handle).await?;
         let handle = dispatcher.handle();

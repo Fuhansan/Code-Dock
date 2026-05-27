@@ -136,7 +136,7 @@ pub async fn start_session(
     }
     let key = keyring_store::load_api_key("bailian")?
         .ok_or_else(|| CommandError::ProviderNotConfigured("bailian".to_string()))?;
-    let session = Session::start(default_session_dir(), key, app).await?;
+    let session = Session::start(default_session_dir(), key, Some(app)).await?;
     *guard = Some(session);
     tracing::info!(target: "aidock::cmd", "session started");
     Ok(())
