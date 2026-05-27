@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
@@ -41,7 +42,7 @@ use crate::agent::role::RoleConfig;
 use crate::agent::roles::PM_ID;
 use crate::agent::state::AgentState;
 use crate::llm::bailian::BailianProvider;
-use crate::llm::{ChatMessage, ChatRequest, LLMProvider};
+use crate::llm::{ChatRequest, LLMProvider};
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
 /// orchestrator await graceful shutdown when the inbox closes.
@@ -106,9 +107,8 @@ async fn run_agent(
             continue;
         }
 
-        // Build the LLM input. Sprint 2.5 replaces this with the real
-        // Level-0 context builder.
-        let llm_input = build_minimal_context(&role, &history, &msg);
+        // Build the LLM input via the Level 0 context builder (Sprint 2.5).
+        let llm_input = build_level_0_context(&role, &history, &msg);
 
         let req = ChatRequest {
             model: role.model.primary.clone(),
@@ -235,56 +235,6 @@ fn broadcast_mentions_me(role_id: &str, content: &str) -> bool {
 
 fn is_pm(role: &RoleConfig) -> bool {
     role.id == PM_ID
-}
-
-// ---------- minimal Level-0 context (full builder in Sprint 2.5) ----------
-
-fn build_minimal_context(role: &RoleConfig, history: &[AgentMessage], latest: &AgentMessage) -> Vec<ChatMessage> {
-    let mut chat = Vec::with_capacity(2);
-    chat.push(ChatMessage::System {
-        content: role.system_prompt.clone(),
-    });
-
-    let mut buf = String::new();
-    buf.push_str("You are in a multi-agent group chat. Here is the conversation so far.\n");
-    buf.push_str("Each line is a message: [msg_id] (sender) TAG: payload.\n\n");
-    for m in history.iter() {
-        buf.push_str(&format_message_for_prompt(m));
-        buf.push('\n');
-    }
-    buf.push_str("\n----\n");
-    buf.push_str(&format!(
-        "Most recent message (the one you must respond to): [{}] from {} as {}.\n",
-        latest.id,
-        latest.sender,
-        latest.kind.tag()
-    ));
-    buf.push_str(&format!("Current topic_id: {}\n", latest.topic_id));
-    buf.push_str("Respond by calling exactly one tool, per the house rules.\n");
-
-    chat.push(ChatMessage::User { content: buf });
-    chat
-}
-
-fn format_message_for_prompt(m: &AgentMessage) -> String {
-    let payload = match &m.kind {
-        AgentMessageKind::Broadcast { content } => content.clone(),
-        AgentMessageKind::AskAgent { to, content, .. } => format!("(to {to}) {content}"),
-        AgentMessageKind::Answer { reply_to, content } => format!("(replying to {reply_to}) {content}"),
-        AgentMessageKind::WorkStart { task } => task.clone(),
-        AgentMessageKind::Progress { task, percent, note } => format!("{task} — {percent}% — {note}"),
-        AgentMessageKind::Done { summary, .. } => summary.clone(),
-        AgentMessageKind::Summary { summary, key_decisions, .. } => {
-            let mut s = summary.clone();
-            if !key_decisions.is_empty() {
-                s.push_str(" | decisions: ");
-                s.push_str(&key_decisions.join("; "));
-            }
-            s
-        }
-        AgentMessageKind::UserInput { content } => content.clone(),
-    };
-    format!("[{}] ({}) {}: {}", m.id, m.sender, m.kind.tag(), payload)
 }
 
 // ---------- assembling and tracking outgoing messages ----------
