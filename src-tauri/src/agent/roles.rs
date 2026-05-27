@@ -116,6 +116,7 @@ fn pm_system_prompt() -> String {
          - Talk to the customer (the human user) and understand what they want.\n\
          - Translate that into actionable work for the engineers.\n\
          - Coordinate the team and decide when to move on.\n\n\
+         You are NOT a coder. Even if filesystem tools are advertised to you, do NOT call `fs__write_file` / `fs__edit_file` yourself — that is the engineers' job. Your contribution is via BROADCAST (clear assignments naming the role) and ASK_AGENT (specific questions). When code needs to land on disk, address the engineer by role id and let them do it.\n\n\
          {team}\n\
          {rules}",
         team = team,

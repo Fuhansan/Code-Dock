@@ -52,8 +52,14 @@ use crate::llm::{ChatMessage, ChatRequest, LLMProvider, Tool};
 
 /// Cap on how many auxiliary→action loops one agent turn may run. Above
 /// this we emit a warning and stop — protects against a model that keeps
-/// recalling / scratchpad-updating without ever committing to an action.
-const MAX_QUERY_LOOP_ITERATIONS: usize = 3;
+/// recalling / scratchpad-updating / MCP-tool-calling without ever
+/// committing to an action.
+///
+/// Bumped from 3 in Sprint 4 after the e2e demo showed a developer
+/// realistically uses 4+ MCP calls per turn (list_directory → write_file
+/// → list_directory → write_file → DONE). Three was too tight for any
+/// non-trivial coding flow.
+const MAX_QUERY_LOOP_ITERATIONS: usize = 6;
 
 /// True iff `name` is a Sprint 4 MCP-routed tool (prefix-tagged at
 /// projection time in `agent::mcp`).
@@ -66,6 +72,24 @@ fn is_mcp_tool(name: &str) -> bool {
 /// fetched data / breadcrumb / fs result in mind.
 fn is_auxiliary_tool(name: &str) -> bool {
     is_query_tool(name) || is_scratchpad_tool(name) || is_mcp_tool(name)
+}
+
+/// True iff this AgentMessageKind concludes the agent's turn. Sprint 4
+/// refinement: WORK_START and PROGRESS are "soft actions" — they dispatch
+/// a message to the team but the emitter keeps thinking (typically to
+/// follow up with fs__write_file calls and a final DONE). Without this
+/// rule a developer agent emitting WORK_START would block forever waiting
+/// for someone to ASK_AGENT them back.
+fn is_terminal_message_kind(kind: &AgentMessageKind) -> bool {
+    matches!(
+        kind,
+        AgentMessageKind::Broadcast { .. }
+            | AgentMessageKind::AskAgent { .. }
+            | AgentMessageKind::Answer { .. }
+            | AgentMessageKind::Done { .. }
+            | AgentMessageKind::Summary { .. }
+    )
+    // NOT terminal: WorkStart, Progress, UserInput (UserInput never emitted by agents).
 }
 
 /// All tools advertised on every LLM call: action message tools + query
@@ -227,150 +251,146 @@ async fn run_agent(boot: AgentBoot) {
                 break false;
             }
 
-            // Split the model's intent into auxiliaries (queries +
-            // scratchpad updates — they loop) vs actions (terminate the
-            // turn).
-            let has_aux = resp
-                .tool_calls
-                .iter()
-                .any(|tc| is_auxiliary_tool(&tc.function.name));
+            // Unified per-tool execution. Every tool call yields a
+            // tool-role response that we feed back to the model; the turn
+            // ends only when at least one *terminal* message (BROADCAST,
+            // ASK_AGENT, ANSWER, DONE, SUMMARY) lands.
+            chat_messages.push(ChatMessage::Assistant {
+                content: resp.content.clone(),
+                tool_calls: resp.tool_calls.clone(),
+            });
 
-            if has_aux {
-                // Anchor the assistant turn that requested the auxiliaries,
-                // then append a tool-role message per executed one.
-                chat_messages.push(ChatMessage::Assistant {
-                    content: resp.content.clone(),
-                    tool_calls: resp.tool_calls.clone(),
-                });
-                for tool_call in &resp.tool_calls {
-                    let name = &tool_call.function.name;
-                    let args = &tool_call.function.arguments;
-                    let body = if is_query_tool(name) {
-                        execute_query_tool(name, args, &history)
-                            .unwrap_or_else(|e| format!("query failed: {e}"))
-                    } else if is_scratchpad_tool(name) {
-                        match apply_scratchpad_update(&mut scratchpad, args) {
-                            Ok(confirmation) => {
-                                // Sprint 3: persist after every successful
-                                // update. A crash never loses more than the
-                                // in-flight LLM call.
-                                if let Err(e) = scratchpad.save(&scratchpad_path) {
-                                    tracing::error!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        path = %scratchpad_path.display(),
-                                        error = %e,
-                                        "scratchpad in-memory updated but save FAILED — next restart loses this update"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        iter,
-                                        "{}", confirmation
-                                    );
-                                }
-                                confirmation
-                            }
-                            Err(e) => format!("scratchpad update failed: {e}"),
-                        }
-                    } else if is_mcp_tool(name) {
-                        // Sprint 4.3: route to filesystem MCP server.
-                        match mcp.as_ref() {
-                            Some(client) => match client.call_tool(name, args).await {
-                                Ok(body) => {
-                                    tracing::info!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        tool = %name,
-                                        iter,
-                                        body_len = body.len(),
-                                        "MCP tool returned"
-                                    );
-                                    body
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        tool = %name,
-                                        error = %e,
-                                        "MCP tool call failed"
-                                    );
-                                    format!("MCP tool '{name}' failed: {e}")
-                                }
-                            },
-                            None => format!(
-                                "MCP tool '{name}' is not available — the filesystem server didn't start this session"
-                            ),
-                        }
-                    } else {
-                        // The model mixed an action with auxiliaries this
-                        // turn. Tell it the action was deferred — it gets
-                        // another shot next iteration to re-emit.
-                        format!(
-                            "action tool '{}' was deferred — emit it again after the auxiliary tool results are in",
-                            name
-                        )
-                    };
-                    chat_messages.push(ChatMessage::Tool {
-                        content: body,
-                        tool_call_id: tool_call.id.clone(),
-                    });
-                }
-                if iter >= MAX_QUERY_LOOP_ITERATIONS {
-                    tracing::warn!(
-                        target: "aidock::agent",
-                        role = %role.id,
-                        "auxiliary-loop hit MAX_QUERY_LOOP_ITERATIONS without action — giving up this turn"
-                    );
-                    break false;
-                }
-                continue;
-            }
-
-            // Pure-action turn — parse, emit, done.
-            let mut any_emitted = false;
+            let mut turn_terminated = false;
             for tool_call in &resp.tool_calls {
-                let parsed = match parse_tool_call(
-                    &tool_call.function.name,
-                    &tool_call.function.arguments,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "aidock::agent",
-                            role = %role.id,
-                            tool = %tool_call.function.name,
-                            error = %e,
-                            "could not parse tool call; skipped"
-                        );
-                        continue;
+                let name = &tool_call.function.name;
+                let args = &tool_call.function.arguments;
+                let body = if is_query_tool(name) {
+                    execute_query_tool(name, args, &history)
+                        .unwrap_or_else(|e| format!("query failed: {e}"))
+                } else if is_scratchpad_tool(name) {
+                    match apply_scratchpad_update(&mut scratchpad, args) {
+                        Ok(confirmation) => {
+                            // Sprint 3: persist after every successful update.
+                            if let Err(e) = scratchpad.save(&scratchpad_path) {
+                                tracing::error!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    path = %scratchpad_path.display(),
+                                    error = %e,
+                                    "scratchpad in-memory updated but save FAILED — next restart loses this update"
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    iter,
+                                    "{}", confirmation
+                                );
+                            }
+                            confirmation
+                        }
+                        Err(e) => format!("scratchpad update failed: {e}"),
+                    }
+                } else if is_mcp_tool(name) {
+                    match mcp.as_ref() {
+                        Some(client) => match client.call_tool(name, args).await {
+                            Ok(body) => {
+                                tracing::info!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    tool = %name,
+                                    iter,
+                                    body_len = body.len(),
+                                    "MCP tool returned"
+                                );
+                                body
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    tool = %name,
+                                    error = %e,
+                                    "MCP tool call failed"
+                                );
+                                format!("MCP tool '{name}' failed: {e}")
+                            }
+                        },
+                        None => format!(
+                            "MCP tool '{name}' is not available — the filesystem server didn't start this session"
+                        ),
+                    }
+                } else {
+                    // Protocol message tool (BROADCAST, ASK_AGENT, ANSWER,
+                    // WORK_START, PROGRESS, DONE, SUMMARY).
+                    match parse_tool_call(name, args) {
+                        Ok(parsed) => {
+                            let outgoing = build_outgoing(&role, parsed, Some(&msg.topic_id));
+                            apply_outgoing_state_transition(&mut state, &outgoing);
+                            // Sprint 2.4 fix: own emits go into local
+                            // history so the next think doesn't duplicate.
+                            history.push(outgoing.clone());
+                            let kind_for_term_check = outgoing.kind.clone();
+                            let tag = outgoing.kind.tag();
+
+                            if let Err(e) = dispatcher.submit(outgoing).await {
+                                tracing::error!(
+                                    target: "aidock::agent",
+                                    role = %role.id,
+                                    error = %e,
+                                    "dispatcher submit failed; agent stopping"
+                                );
+                                return;
+                            }
+
+                            if is_terminal_message_kind(&kind_for_term_check) {
+                                turn_terminated = true;
+                            }
+                            // For soft-actions (WORK_START / PROGRESS),
+                            // tell the model the dispatch happened and
+                            // it should continue — typically with the
+                            // fs__write_file calls that actually do the
+                            // work.
+                            if is_terminal_message_kind(&kind_for_term_check) {
+                                format!("{} dispatched to the team", tag)
+                            } else {
+                                format!(
+                                    "{} dispatched. Continue with the task — write your files via fs__ tools, then emit DONE when finished.",
+                                    tag
+                                )
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "aidock::agent",
+                                role = %role.id,
+                                tool = %name,
+                                error = %e,
+                                "could not parse tool call; skipped"
+                            );
+                            format!("could not parse '{name}': {e}")
+                        }
                     }
                 };
-
-                let outgoing = build_outgoing(&role, parsed, Some(&msg.topic_id));
-                // Transition state BEFORE submitting — if the submit fails we
-                // still reflect the local commitment correctly.
-                apply_outgoing_state_transition(&mut state, &outgoing);
-                // Push our own emit into local history so the next think sees
-                // what we already said. Without this the LLM thinks unanswered
-                // ASKs are still pending and produces duplicate ANSWERs
-                // (witnessed in the first multi-agent demo run).
-                history.push(outgoing.clone());
-
-                if let Err(e) = dispatcher.submit(outgoing).await {
-                    tracing::error!(
-                        target: "aidock::agent",
-                        role = %role.id,
-                        error = %e,
-                        "dispatcher submit failed; agent stopping"
-                    );
-                    return;
-                }
-                any_emitted = true;
+                chat_messages.push(ChatMessage::Tool {
+                    content: body,
+                    tool_call_id: tool_call.id.clone(),
+                });
             }
-            break any_emitted;
+
+            if turn_terminated {
+                break true;
+            }
+            if iter >= MAX_QUERY_LOOP_ITERATIONS {
+                tracing::warn!(
+                    target: "aidock::agent",
+                    role = %role.id,
+                    "agent loop hit MAX_QUERY_LOOP_ITERATIONS without a terminal action — giving up this turn"
+                );
+                break false;
+            }
+            // Otherwise loop: model gets to see all tool results in chat_messages
+            // and decide its next move (typically more fs__ writes or DONE).
         };
         let _ = emitted_action;
     }
