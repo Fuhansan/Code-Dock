@@ -38,11 +38,26 @@ use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
+use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
 use crate::agent::role::RoleConfig;
 use crate::agent::roles::PM_ID;
 use crate::agent::state::AgentState;
 use crate::llm::bailian::BailianProvider;
-use crate::llm::{ChatRequest, LLMProvider};
+use crate::llm::{ChatMessage, ChatRequest, LLMProvider, Tool};
+
+/// Cap on how many query→answer loops one agent turn may run. Above this we
+/// emit a warning and stop — protects against a model that keeps recalling
+/// without ever committing to an action tool.
+const MAX_QUERY_LOOP_ITERATIONS: usize = 3;
+
+/// Concatenation of action message tools (BROADCAST, ASK_AGENT, …) and
+/// query tools (recall_topic, search_topic). Advertised together on every
+/// LLM call.
+fn all_tools() -> Vec<Tool> {
+    let mut tools = message_tools();
+    tools.extend(query_tools());
+    tools
+}
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
 /// orchestrator await graceful shutdown when the inbox closes.
@@ -107,79 +122,149 @@ async fn run_agent(
             continue;
         }
 
-        // Build the LLM input via the Level 0 context builder (Sprint 2.5).
-        let llm_input = build_level_0_context(&role, &history, &msg);
+        // Build the Level 0 context (Sprint 2.5).
+        let mut chat_messages = build_level_0_context(&role, &history, &msg);
 
-        let req = ChatRequest {
-            model: role.model.primary.clone(),
-            messages: llm_input,
-            temperature: Some(role.model.temperature),
-            max_tokens: Some(role.model.max_tokens),
-            tools: message_tools(),
-            tool_choice: Some(json!("auto")),
-        };
+        // Multi-turn LLM loop: query tools (Sprint 2.7) fetch data and feed
+        // back into the conversation; we stop as soon as the model emits at
+        // least one *action* tool call, or after MAX_QUERY_LOOP_ITERATIONS.
+        let mut iter = 0usize;
+        let emitted_action = loop {
+            iter += 1;
+            let req = ChatRequest {
+                model: role.model.primary.clone(),
+                messages: chat_messages.clone(),
+                temperature: Some(role.model.temperature),
+                max_tokens: Some(role.model.max_tokens),
+                tools: all_tools(),
+                tool_choice: Some(json!("auto")),
+            };
 
-        let resp = match provider.chat_completion(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    target: "aidock::agent",
-                    role = %role.id,
-                    error = %e,
-                    "LLM call failed; agent stays silent this turn"
-                );
-                continue;
-            }
-        };
-
-        if resp.tool_calls.is_empty() {
-            // Sprint 1 harness showed Qwen reliably picks a tool, but be
-            // defensive — silent skip on the rare free-text response.
-            tracing::warn!(
-                target: "aidock::agent",
-                role = %role.id,
-                content_preview = ?resp.content.as_deref().map(|s| &s[..s.len().min(120)]),
-                "LLM returned no tool calls; turn skipped"
-            );
-            continue;
-        }
-
-        for tool_call in resp.tool_calls {
-            let parsed = match parse_tool_call(&tool_call.function.name, &tool_call.function.arguments) {
-                Ok(p) => p,
+            let resp = match provider.chat_completion(req).await {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         target: "aidock::agent",
                         role = %role.id,
-                        tool = %tool_call.function.name,
                         error = %e,
-                        "could not parse tool call; skipped"
+                        iter,
+                        "LLM call failed; agent stays silent this turn"
                     );
-                    continue;
+                    break false;
                 }
             };
 
-            // The topic we'll inherit if the LLM didn't pin one in the tool call.
-            let outgoing = build_outgoing(&role, parsed, Some(&msg.topic_id));
-            // Transition state BEFORE submitting — if the submit fails we
-            // still reflect the local commitment correctly.
-            apply_outgoing_state_transition(&mut state, &outgoing);
-            // Push our own emit into local history so the next think sees
-            // what we already said. Without this the LLM thinks unanswered
-            // ASKs are still pending and produces duplicate ANSWERs
-            // (witnessed in the first multi-agent demo run).
-            history.push(outgoing.clone());
-
-            if let Err(e) = dispatcher.submit(outgoing).await {
-                tracing::error!(
+            if resp.tool_calls.is_empty() {
+                tracing::warn!(
                     target: "aidock::agent",
                     role = %role.id,
-                    error = %e,
-                    "dispatcher submit failed; agent stopping"
+                    iter,
+                    content_preview = ?resp.content.as_deref().map(|s| &s[..s.len().min(120)]),
+                    "LLM returned no tool calls; turn skipped"
                 );
-                return;
+                break false;
             }
-        }
+
+            // Split the model's intent into queries vs actions.
+            let has_query = resp.tool_calls.iter().any(|tc| is_query_tool(&tc.function.name));
+
+            if has_query {
+                // Anchor the assistant turn that requested the queries, then
+                // append a tool-role message per executed query.
+                chat_messages.push(ChatMessage::Assistant {
+                    content: resp.content.clone(),
+                    tool_calls: resp.tool_calls.clone(),
+                });
+                for tool_call in &resp.tool_calls {
+                    if !is_query_tool(&tool_call.function.name) {
+                        // The model mixed a query with an action this turn.
+                        // We tell the model so it doesn't think we silently
+                        // applied the action; it will get another shot next
+                        // iteration to re-emit the action with query results
+                        // in hand.
+                        chat_messages.push(ChatMessage::Tool {
+                            content: format!(
+                                "action tool '{}' was deferred — emit it again after reading the query results",
+                                tool_call.function.name
+                            ),
+                            tool_call_id: tool_call.id.clone(),
+                        });
+                        continue;
+                    }
+                    let body = execute_query_tool(
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                        &history,
+                    )
+                    .unwrap_or_else(|e| format!("query failed: {e}"));
+                    tracing::info!(
+                        target: "aidock::agent",
+                        role = %role.id,
+                        tool = %tool_call.function.name,
+                        iter,
+                        body_len = body.len(),
+                        "executed query tool"
+                    );
+                    chat_messages.push(ChatMessage::Tool {
+                        content: body,
+                        tool_call_id: tool_call.id.clone(),
+                    });
+                }
+                if iter >= MAX_QUERY_LOOP_ITERATIONS {
+                    tracing::warn!(
+                        target: "aidock::agent",
+                        role = %role.id,
+                        "query-loop hit MAX_QUERY_LOOP_ITERATIONS without action — giving up this turn"
+                    );
+                    break false;
+                }
+                continue;
+            }
+
+            // Pure-action turn — parse, emit, done.
+            let mut any_emitted = false;
+            for tool_call in &resp.tool_calls {
+                let parsed = match parse_tool_call(
+                    &tool_call.function.name,
+                    &tool_call.function.arguments,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "aidock::agent",
+                            role = %role.id,
+                            tool = %tool_call.function.name,
+                            error = %e,
+                            "could not parse tool call; skipped"
+                        );
+                        continue;
+                    }
+                };
+
+                let outgoing = build_outgoing(&role, parsed, Some(&msg.topic_id));
+                // Transition state BEFORE submitting — if the submit fails we
+                // still reflect the local commitment correctly.
+                apply_outgoing_state_transition(&mut state, &outgoing);
+                // Push our own emit into local history so the next think sees
+                // what we already said. Without this the LLM thinks unanswered
+                // ASKs are still pending and produces duplicate ANSWERs
+                // (witnessed in the first multi-agent demo run).
+                history.push(outgoing.clone());
+
+                if let Err(e) = dispatcher.submit(outgoing).await {
+                    tracing::error!(
+                        target: "aidock::agent",
+                        role = %role.id,
+                        error = %e,
+                        "dispatcher submit failed; agent stopping"
+                    );
+                    return;
+                }
+                any_emitted = true;
+            }
+            break any_emitted;
+        };
+        let _ = emitted_action;
     }
 
     tracing::info!(target: "aidock::agent", role = %role.id, "agent task ended");

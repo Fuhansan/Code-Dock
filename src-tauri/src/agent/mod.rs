@@ -15,6 +15,7 @@ pub mod context;
 pub mod dispatcher;
 pub mod message;
 pub mod protocol;
+pub mod recall;
 pub mod role;
 pub mod roles;
 pub mod runtime;

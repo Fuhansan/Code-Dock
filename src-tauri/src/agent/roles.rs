@@ -44,7 +44,11 @@ fn shared_rules() -> &'static str {
         - No teammate is currently WORKING on something tied to this topic\n   \
         - The topic's question(s) are actually resolved, not just acknowledged\n     \
         DO NOT SUMMARY merely because the team agreed on an API contract — the contract is a milestone, not the topic's end. Wait until DONE messages have landed.\n\
-     7. Voice: terse and action-oriented. No greetings, apologies, filler, or restating the question."
+     7. Voice: terse and action-oriented. No greetings, apologies, filler, or restating the question.\n\
+     8. Two QUERY tools are available alongside the action tools:\n   \
+        - `recall_topic(topic_id)` — pull the full message stream of a topic you only see summarised in your context. Use BEFORE acting if you genuinely need the detail.\n   \
+        - `search_topic(topic_id, query)` — find matching messages in a topic by substring (case-insensitive).\n     \
+        Query tools return data to you and let you act next turn. They are not a substitute for the action tools — every turn must still end with one of BROADCAST / ASK_AGENT / ANSWER / WORK_START / PROGRESS / DONE / SUMMARY."
 }
 
 fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {

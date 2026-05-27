@@ -145,6 +145,41 @@ impl AgentMessageKind {
             Self::UserInput { .. } => "USER_INPUT",
         }
     }
+
+    /// Compact, human-readable rendering of the payload for prompts and
+    /// recall output. Variant-aware: ASK_AGENT prefixes the recipient,
+    /// ANSWER shows the reply_to, SUMMARY appends decisions, etc.
+    pub fn payload_preview(&self) -> String {
+        match self {
+            Self::Broadcast { content } => content.clone(),
+            Self::AskAgent { to, content, .. } => format!("(→ {}) {}", to, content),
+            Self::Answer { reply_to, content } => format!("(re {}) {}", reply_to, content),
+            Self::WorkStart { task } => task.clone(),
+            Self::Progress { task, percent, note } => {
+                if note.is_empty() {
+                    format!("{} — {}%", task, percent)
+                } else {
+                    format!("{} — {}% — {}", task, percent, note)
+                }
+            }
+            Self::Done { summary, artifact_id } => match artifact_id {
+                Some(id) => format!("{} (artifact: {})", summary, id),
+                None => summary.clone(),
+            },
+            Self::Summary {
+                summary,
+                key_decisions,
+                ..
+            } => {
+                if key_decisions.is_empty() {
+                    summary.clone()
+                } else {
+                    format!("{} | decisions: {}", summary, key_decisions.join("; "))
+                }
+            }
+            Self::UserInput { content } => content.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

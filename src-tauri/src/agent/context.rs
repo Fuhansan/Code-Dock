@@ -139,40 +139,13 @@ pub fn build_level_0_context(
 
 /// Single-line projection of one message for the prompt.
 fn format_message_line(m: &AgentMessage) -> String {
-    let body = payload_preview(&m.kind);
-    format!("- [{}] ({}) {}: {}", m.id, m.sender, m.kind.tag(), body)
-}
-
-fn payload_preview(kind: &AgentMessageKind) -> String {
-    match kind {
-        AgentMessageKind::Broadcast { content } => content.clone(),
-        AgentMessageKind::AskAgent { to, content, .. } => format!("(→ {}) {}", to, content),
-        AgentMessageKind::Answer { reply_to, content } => format!("(re {}) {}", reply_to, content),
-        AgentMessageKind::WorkStart { task } => task.clone(),
-        AgentMessageKind::Progress { task, percent, note } => {
-            if note.is_empty() {
-                format!("{} — {}%", task, percent)
-            } else {
-                format!("{} — {}% — {}", task, percent, note)
-            }
-        }
-        AgentMessageKind::Done { summary, artifact_id } => match artifact_id {
-            Some(id) => format!("{} (artifact: {})", summary, id),
-            None => summary.clone(),
-        },
-        AgentMessageKind::Summary {
-            summary,
-            key_decisions,
-            ..
-        } => {
-            if key_decisions.is_empty() {
-                summary.clone()
-            } else {
-                format!("{} | decisions: {}", summary, key_decisions.join("; "))
-            }
-        }
-        AgentMessageKind::UserInput { content } => content.clone(),
-    }
+    format!(
+        "- [{}] ({}) {}: {}",
+        m.id,
+        m.sender,
+        m.kind.tag(),
+        m.kind.payload_preview()
+    )
 }
 
 fn format_closed_topics(
@@ -257,7 +230,7 @@ fn format_cross_topic_mentions(
             m.id,
             m.topic_id,
             m.sender,
-            payload_preview(&m.kind)
+            m.kind.payload_preview()
         ));
     }
     s
@@ -272,7 +245,7 @@ fn message_mentions_me(role_id: &str, m: &AgentMessage) -> bool {
             return true;
         }
     }
-    payload_preview(&m.kind).contains(role_id)
+    m.kind.payload_preview().contains(role_id)
 }
 
 #[cfg(test)]
