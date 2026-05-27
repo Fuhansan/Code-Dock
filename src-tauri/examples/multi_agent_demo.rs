@@ -97,11 +97,52 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("┌─ Analysis ─────────────────────────────────────────");
     analyze(&messages_path);
+    print_workspace(&session_dir);
     println!("└─");
     println!();
     println!("Full log: {}", messages_path.display());
 
     Ok(())
+}
+
+/// Sprint 4: enumerate everything the agents created under workspace/.
+/// Lets us see at a glance whether they exercised the filesystem MCP
+/// tools or stayed chat-only.
+fn print_workspace(session_dir: &Path) {
+    let ws = session_dir.join("workspace");
+    if !ws.exists() {
+        println!("│ workspace: (not created — MCP didn't initialise)");
+        return;
+    }
+    let mut files = Vec::new();
+    collect_files(&ws, &ws, &mut files);
+    if files.is_empty() {
+        println!("│ workspace: empty — agents didn't write any files this run");
+        return;
+    }
+    println!("│ workspace: {} file(s) written", files.len());
+    for (rel, size) in &files {
+        println!("│   {} ({} bytes)", rel, size);
+    }
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            collect_files(root, &p, out);
+        } else {
+            let rel = p
+                .strip_prefix(root)
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|_| p.display().to_string());
+            out.push((rel, md.len()));
+        }
+    }
 }
 
 fn count_lines(path: &Path) -> std::io::Result<usize> {

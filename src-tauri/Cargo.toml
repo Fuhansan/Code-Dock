@@ -42,9 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Message identifiers
 uuid = { version = "1", features = ["v4"] }
 
-# Sprint 4 prep — research only for now. The smoke-test example uses this
-# to verify the official Rust MCP SDK can drive a filesystem MCP server
-# end-to-end before we commit Sprint 4 architecture to it.
-[dev-dependencies]
+# Sprint 4 — MCP client. Official Anthropic Rust SDK.
+# Phase 0.2 smoke test (commit 27cab05) verified the version + transport
+# we use here against the reference filesystem MCP server.
 rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }
 

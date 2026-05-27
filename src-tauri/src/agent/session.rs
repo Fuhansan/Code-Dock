@@ -19,9 +19,11 @@
 
 use std::path::PathBuf;
 
+use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::agent::dispatcher::{filter_visible_to, Dispatcher, DispatcherError, DispatcherHandle};
+use crate::agent::mcp::{McpClient, McpError};
 use crate::agent::message::{AgentMessage, TopicId};
 use crate::agent::roles::default_workshop;
 use crate::agent::runtime::{spawn_agent, user_input_message, AgentBoot};
@@ -31,6 +33,10 @@ use crate::agent::state::AgentState;
 /// V0.1 default topic id. Sprint 2.6 introduces dynamic topic creation
 /// driven by Agents declaring `new_topic_title`.
 pub const DEFAULT_TOPIC_ID: &str = "t-default";
+
+/// Subdirectory under each session where filesystem MCP server is sandboxed.
+/// Agents write real code here — outside is denied by the server itself.
+pub const WORKSPACE_SUBDIR: &str = "workspace";
 
 /// Holds the dispatcher handle plus the JoinHandles of every spawned task.
 /// Tasks are kept alive for the lifetime of `Session`; dropping the struct
@@ -50,12 +56,60 @@ pub enum SessionError {
     Dispatcher(#[from] DispatcherError),
     #[error("could not submit user message: dispatcher channel closed")]
     SubmitClosed,
+    #[error("workspace dir setup: {context}: {source}")]
+    Workspace {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Ensure `session_dir/workspace/` exists and return its canonical path.
+/// Sprint 4.4: canonicalize because the filesystem MCP server matches
+/// allowed dirs against canonical paths (the macOS /var → /private/var
+/// symlink would otherwise look like a path-traversal attempt).
+async fn ensure_workspace_dir(session_dir: &PathBuf) -> Result<PathBuf, SessionError> {
+    let raw = session_dir.join(WORKSPACE_SUBDIR);
+    tokio::fs::create_dir_all(&raw)
+        .await
+        .map_err(|source| SessionError::Workspace {
+            context: "create workspace dir",
+            source,
+        })?;
+    std::fs::canonicalize(&raw).map_err(|source| SessionError::Workspace {
+        context: "canonicalize workspace dir",
+        source,
+    })
+}
+
+/// Build the command that launches the Node-based reference filesystem
+/// MCP server, scoped to `workspace`. Pure factory — no spawning yet,
+/// kept separate so tests can inspect what we'd run without doing it.
+fn build_filesystem_mcp_command(workspace: &PathBuf) -> Command {
+    let mut cmd = Command::new("npx");
+    cmd.args([
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        workspace.to_string_lossy().as_ref(),
+    ]);
+    cmd
+}
+
+async fn spawn_filesystem_mcp(workspace: &PathBuf) -> Result<McpClient, McpError> {
+    let cmd = build_filesystem_mcp_command(workspace);
+    McpClient::start(cmd).await
 }
 
 impl Session {
     /// Build a Session: open the dispatcher (which rehydrates from disk),
-    /// for each role in the default workshop derive its restored state from
-    /// the loaded messages, load its scratchpad, and spawn its runtime.
+    /// spawn the filesystem MCP server scoped to the session's workspace
+    /// dir, then for each role in the default workshop derive its restored
+    /// state, load its scratchpad, and spawn its runtime with the MCP
+    /// handle.
+    ///
+    /// MCP spawn is best-effort — if `npx` is missing or the server
+    /// fails to initialise, the session continues without filesystem
+    /// access (agents become chat-only). The session logs why.
     ///
     /// Pass `None` for `app_handle` to run headless (dev harnesses).
     pub async fn start(
@@ -68,6 +122,30 @@ impl Session {
         let handle = dispatcher.handle();
 
         let scratchpad_dir = session_dir.join("scratchpads");
+        let workspace_dir = ensure_workspace_dir(&session_dir).await?;
+
+        // Sprint 4.2: spawn filesystem MCP server. Best-effort — on
+        // failure agents simply have no filesystem tools available.
+        let mcp = match spawn_filesystem_mcp(&workspace_dir).await {
+            Ok(client) => {
+                tracing::info!(
+                    target: "aidock::session",
+                    tool_count = client.advertised_tools().len(),
+                    workspace = %workspace_dir.display(),
+                    "filesystem MCP server ready"
+                );
+                Some(client)
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "aidock::session",
+                    error = %e,
+                    workspace = %workspace_dir.display(),
+                    "filesystem MCP server failed to start — agents will run chat-only"
+                );
+                None
+            }
+        };
 
         let mut agent_tasks = Vec::new();
         for role in default_workshop() {
@@ -101,6 +179,7 @@ impl Session {
                 initial_state,
                 initial_scratchpad,
                 scratchpad_path,
+                mcp: mcp.clone(),
             };
             agent_tasks.push(spawn_agent(boot));
         }
@@ -111,6 +190,7 @@ impl Session {
             target: "aidock::session",
             agent_count = agent_tasks.len(),
             loaded = loaded.len(),
+            mcp_enabled = mcp.is_some(),
             "session started"
         );
 

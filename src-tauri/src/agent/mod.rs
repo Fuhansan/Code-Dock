@@ -13,6 +13,7 @@
 
 pub mod context;
 pub mod dispatcher;
+pub mod mcp;
 pub mod message;
 pub mod persistence;
 pub mod protocol;

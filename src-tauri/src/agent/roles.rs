@@ -51,7 +51,8 @@ fn shared_rules() -> &'static str {
         Query tools return data to you and let you act next turn. They are not a substitute for the action tools — every turn must still end with one of BROADCAST / ASK_AGENT / ANSWER / WORK_START / PROGRESS / DONE / SUMMARY.\n\
      9. One SCRATCHPAD tool:\n   \
         - `update_scratchpad(current_focus?, add_tasks?, add_files?, add_decisions?)` — write to your private notes. Only YOU see this; teammates don't. The runtime pins it to your prompt every turn so you don't forget. Use it when you decompose a task, commit to a non-obvious decision, or record a file you touched.\n     \
-        Don't update the scratchpad every turn — only when something durable changed. After updating, emit your action tool on the NEXT turn."
+        Don't update the scratchpad every turn — only when something durable changed. After updating, emit your action tool on the NEXT turn.\n\
+    10. FILESYSTEM tools (prefix `fs__`): if these are advertised this session, you can ACTUALLY read and write files in the workspace dir. `fs__write_file` and `fs__edit_file` create real files on disk. When the team agrees a file should exist, emit `fs__write_file` instead of pasting the content as a BROADCAST. Tool results loop back to you so you can WORK_START / PROGRESS / DONE around the writes."
 }
 
 fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {

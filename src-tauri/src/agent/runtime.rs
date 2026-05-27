@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
+use crate::agent::mcp::{McpClient, MCP_TOOL_PREFIX};
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
@@ -54,20 +55,30 @@ use crate::llm::{ChatMessage, ChatRequest, LLMProvider, Tool};
 /// recalling / scratchpad-updating without ever committing to an action.
 const MAX_QUERY_LOOP_ITERATIONS: usize = 3;
 
+/// True iff `name` is a Sprint 4 MCP-routed tool (prefix-tagged at
+/// projection time in `agent::mcp`).
+fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with(MCP_TOOL_PREFIX)
+}
+
+/// True iff this tool call DOES NOT end the agent's turn. Query, scratchpad
+/// and MCP tools all loop back to the LLM so the agent can act with the
+/// fetched data / breadcrumb / fs result in mind.
+fn is_auxiliary_tool(name: &str) -> bool {
+    is_query_tool(name) || is_scratchpad_tool(name) || is_mcp_tool(name)
+}
+
 /// All tools advertised on every LLM call: action message tools + query
-/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8).
-fn all_tools() -> Vec<Tool> {
+/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8) + MCP filesystem
+/// tools (Sprint 4) if the session has an MCP client up.
+fn build_all_tools(mcp: Option<&McpClient>) -> Vec<Tool> {
     let mut tools = message_tools();
     tools.extend(query_tools());
     tools.extend(scratchpad_tools());
+    if let Some(client) = mcp {
+        tools.extend(client.advertised_tools().iter().cloned());
+    }
     tools
-}
-
-/// True iff this tool call DOES NOT end the agent's turn. Both query tools
-/// and `update_scratchpad` loop back to the LLM so the agent can act with
-/// the new info / breadcrumb in mind.
-fn is_auxiliary_tool(name: &str) -> bool {
-    is_query_tool(name) || is_scratchpad_tool(name)
 }
 
 /// Everything the runtime needs at spawn time. Holding this as a struct
@@ -90,6 +101,9 @@ pub struct AgentBoot {
     /// successful `update_scratchpad` so crashes never lose more than the
     /// in-flight LLM call.
     pub scratchpad_path: PathBuf,
+    /// Shared MCP client handle (Sprint 4). `None` when the filesystem
+    /// MCP server failed to start — agents run chat-only in that case.
+    pub mcp: Option<McpClient>,
 }
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
@@ -108,6 +122,7 @@ async fn run_agent(boot: AgentBoot) {
         initial_state,
         initial_scratchpad,
         scratchpad_path,
+        mcp,
     } = boot;
 
     tracing::info!(
@@ -115,8 +130,13 @@ async fn run_agent(boot: AgentBoot) {
         role = %role.id,
         recovered_msgs = initial_history.len(),
         state = initial_state.tag(),
+        mcp_tools = mcp.as_ref().map(|m| m.advertised_tools().len()).unwrap_or(0),
         "agent task started"
     );
+
+    // Pre-compute the full tool list once per agent (MCP tools are static
+    // across the session — server's tool catalog doesn't change).
+    let tools = build_all_tools(mcp.as_ref());
 
     let provider = BailianProvider::new(api_key);
     let mut state = initial_state;
@@ -178,7 +198,7 @@ async fn run_agent(boot: AgentBoot) {
                 messages: chat_messages.clone(),
                 temperature: Some(role.model.temperature),
                 max_tokens: Some(role.model.max_tokens),
-                tools: all_tools(),
+                tools: tools.clone(),
                 tool_choice: Some(json!("auto")),
             };
 
@@ -253,6 +273,36 @@ async fn run_agent(boot: AgentBoot) {
                                 confirmation
                             }
                             Err(e) => format!("scratchpad update failed: {e}"),
+                        }
+                    } else if is_mcp_tool(name) {
+                        // Sprint 4.3: route to filesystem MCP server.
+                        match mcp.as_ref() {
+                            Some(client) => match client.call_tool(name, args).await {
+                                Ok(body) => {
+                                    tracing::info!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        tool = %name,
+                                        iter,
+                                        body_len = body.len(),
+                                        "MCP tool returned"
+                                    );
+                                    body
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        tool = %name,
+                                        error = %e,
+                                        "MCP tool call failed"
+                                    );
+                                    format!("MCP tool '{name}' failed: {e}")
+                                }
+                            },
+                            None => format!(
+                                "MCP tool '{name}' is not available — the filesystem server didn't start this session"
+                            ),
                         }
                     } else {
                         // The model mixed an action with auxiliaries this
