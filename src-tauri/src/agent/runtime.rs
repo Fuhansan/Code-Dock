@@ -27,6 +27,7 @@
 //!   - ASK_AGENT       → WAITING_ANSWER
 //!   - matching ANSWER incoming → drops WAITING_ANSWER before deciding
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -69,30 +70,58 @@ fn is_auxiliary_tool(name: &str) -> bool {
     is_query_tool(name) || is_scratchpad_tool(name)
 }
 
-/// Spawn one Agent task. The returned `JoinHandle` lets the session
-/// orchestrator await graceful shutdown when the inbox closes.
-pub fn spawn_agent(
-    role: RoleConfig,
-    inbox_rx: mpsc::Receiver<AgentMessage>,
-    dispatcher: DispatcherHandle,
-    api_key: String,
-) -> JoinHandle<()> {
-    tokio::spawn(run_agent(role, inbox_rx, dispatcher, api_key))
+/// Everything the runtime needs at spawn time. Holding this as a struct
+/// keeps the spawn_agent signature stable as Sprint 3+ adds more recovered
+/// state fields.
+pub struct AgentBoot {
+    pub role: RoleConfig,
+    pub inbox_rx: mpsc::Receiver<AgentMessage>,
+    pub dispatcher: DispatcherHandle,
+    pub api_key: String,
+    /// Messages this agent already saw in prior sessions, in arrival order.
+    /// Empty for a fresh session.
+    pub initial_history: Vec<AgentMessage>,
+    /// State machine snapshot. Typically derived from `initial_history`
+    /// via `AgentState::derive_from_history` by the session orchestrator.
+    pub initial_state: AgentState,
+    /// Loaded scratchpad — `Default` for fresh sessions.
+    pub initial_scratchpad: Scratchpad,
+    /// Where to persist scratchpad updates. The runtime writes after every
+    /// successful `update_scratchpad` so crashes never lose more than the
+    /// in-flight LLM call.
+    pub scratchpad_path: PathBuf,
 }
 
-async fn run_agent(
-    role: RoleConfig,
-    mut inbox_rx: mpsc::Receiver<AgentMessage>,
-    dispatcher: DispatcherHandle,
-    api_key: String,
-) {
-    tracing::info!(target: "aidock::agent", role = %role.id, "agent task started");
+/// Spawn one Agent task. The returned `JoinHandle` lets the session
+/// orchestrator await graceful shutdown when the inbox closes.
+pub fn spawn_agent(boot: AgentBoot) -> JoinHandle<()> {
+    tokio::spawn(run_agent(boot))
+}
+
+async fn run_agent(boot: AgentBoot) {
+    let AgentBoot {
+        role,
+        mut inbox_rx,
+        dispatcher,
+        api_key,
+        initial_history,
+        initial_state,
+        initial_scratchpad,
+        scratchpad_path,
+    } = boot;
+
+    tracing::info!(
+        target: "aidock::agent",
+        role = %role.id,
+        recovered_msgs = initial_history.len(),
+        state = initial_state.tag(),
+        "agent task started"
+    );
+
     let provider = BailianProvider::new(api_key);
-    let mut state = AgentState::Idle;
-    let mut history: Vec<AgentMessage> = Vec::new();
-    // Sprint 2.8: the agent's private notes. Lives in-memory for this task's
-    // lifetime; Sprint 3 will serialise on session end.
-    let mut scratchpad = Scratchpad::default();
+    let mut state = initial_state;
+    let mut history: Vec<AgentMessage> = initial_history;
+    let mut scratchpad = initial_scratchpad;
 
     while let Some(msg) = inbox_rx.recv().await {
         tracing::debug!(
@@ -202,12 +231,25 @@ async fn run_agent(
                     } else if is_scratchpad_tool(name) {
                         match apply_scratchpad_update(&mut scratchpad, args) {
                             Ok(confirmation) => {
-                                tracing::info!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    iter,
-                                    "{}", confirmation
-                                );
+                                // Sprint 3: persist after every successful
+                                // update. A crash never loses more than the
+                                // in-flight LLM call.
+                                if let Err(e) = scratchpad.save(&scratchpad_path) {
+                                    tracing::error!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        path = %scratchpad_path.display(),
+                                        error = %e,
+                                        "scratchpad in-memory updated but save FAILED — next restart loses this update"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        iter,
+                                        "{}", confirmation
+                                    );
+                                }
                                 confirmation
                             }
                             Err(e) => format!("scratchpad update failed: {e}"),

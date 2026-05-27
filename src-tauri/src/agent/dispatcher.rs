@@ -50,6 +50,68 @@ fn derive_title_from_first_message(msg: &AgentMessage) -> Option<String> {
     Some(cleaned.chars().take(MAX).collect())
 }
 
+/// Apply one message to a topic map: open the topic on first sight (with
+/// title priority opens_topic_title → first-payload prefix → topic_id),
+/// add the sender as a participant, and close on SUMMARY.
+///
+/// Used by both the live `update_topic` path and the Sprint 3 reload path
+/// in `Dispatcher::new`, so reload and live state stay in lockstep.
+pub(crate) fn apply_message_to_topics(
+    topics: &mut HashMap<TopicId, Topic>,
+    msg: &AgentMessage,
+) {
+    let is_new = !topics.contains_key(&msg.topic_id);
+    if is_new {
+        let title = msg
+            .opens_topic_title
+            .clone()
+            .or_else(|| derive_title_from_first_message(msg))
+            .unwrap_or_else(|| msg.topic_id.clone());
+        topics.insert(
+            msg.topic_id.clone(),
+            Topic::open(msg.topic_id.clone(), title, msg.timestamp),
+        );
+    }
+    let topic = topics
+        .get_mut(&msg.topic_id)
+        .expect("just inserted above if missing");
+    topic.add_participant(&msg.sender);
+
+    if let AgentMessageKind::Summary {
+        summary,
+        key_decisions,
+        ..
+    } = &msg.kind
+    {
+        topic.close(summary.clone(), key_decisions.clone(), msg.timestamp);
+    }
+}
+
+/// Filter a message stream down to messages this agent would have seen
+/// via the dispatcher's routing rules. Used by `Session::start` to seed
+/// each agent's local history after a restart.
+///
+/// Rules mirror `Dispatcher::route`:
+/// - Own emits: included (so the agent recognises its own past actions
+///   and doesn't duplicate ANSWERs — the Sprint 2.4 bug).
+/// - ASK_AGENT { to }: only included for the named target.
+/// - Everything else: included for any agent that isn't the sender.
+pub fn filter_visible_to(messages: &[AgentMessage], agent_id: &str) -> Vec<AgentMessage> {
+    messages
+        .iter()
+        .filter(|m| {
+            if m.sender == agent_id {
+                return true;
+            }
+            match &m.kind {
+                AgentMessageKind::AskAgent { to, .. } => to == agent_id,
+                _ => true,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// Channel capacities chosen for V0.1's expected message rate. Bumping later
 /// is harmless — the producers all use `send` (back-pressure aware), not
 /// `try_send`.
@@ -100,6 +162,11 @@ pub struct Dispatcher {
     submit_rx: mpsc::Receiver<AgentMessage>,
     messages_file: File,
     topics: HashMap<TopicId, Topic>,
+    /// Messages loaded from a previous run's `messages.jsonl` on startup.
+    /// Sprint 3: `Session::start` reads this to seed each agent's local
+    /// history + initial state. Cleared via `take_loaded_messages()` after
+    /// distribution so the dispatcher doesn't hold a duplicate copy.
+    loaded_messages: Vec<AgentMessage>,
     app_handle: Option<tauri::AppHandle>,
 }
 
@@ -131,6 +198,30 @@ impl Dispatcher {
             })?;
 
         let messages_path = session_dir.join("messages.jsonl");
+
+        // Sprint 3: rehydrate previous-session state from messages.jsonl
+        // BEFORE opening for append. Malformed tail-lines are skipped with
+        // a warning by read_jsonl_messages — we never refuse to start.
+        let loaded_messages = crate::agent::persistence::read_jsonl_messages(&messages_path)
+            .map_err(|source| DispatcherError::Io {
+                context: "load messages.jsonl",
+                source: std::io::Error::other(source.to_string()),
+            })?;
+
+        let mut topics: HashMap<TopicId, Topic> = HashMap::new();
+        for msg in &loaded_messages {
+            apply_message_to_topics(&mut topics, msg);
+        }
+
+        if !loaded_messages.is_empty() {
+            tracing::info!(
+                target: "aidock::dispatcher",
+                loaded = loaded_messages.len(),
+                topics = topics.len(),
+                "rehydrated state from messages.jsonl"
+            );
+        }
+
         let messages_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -154,9 +245,17 @@ impl Dispatcher {
             submit_tx: Some(submit_tx),
             submit_rx,
             messages_file,
-            topics: HashMap::new(),
+            topics,
+            loaded_messages,
             app_handle,
         })
+    }
+
+    /// Hand the previously-loaded messages to `Session::start` for
+    /// distribution to agents. After this call the dispatcher no longer
+    /// holds them — they live in each agent's local history.
+    pub fn take_loaded_messages(&mut self) -> Vec<AgentMessage> {
+        std::mem::take(&mut self.loaded_messages)
     }
 
     /// Register an Agent. Returns the receiver the Agent's runtime task will
@@ -251,49 +350,7 @@ impl Dispatcher {
     /// Mutate `self.topics` based on this message. Topic creation is implicit:
     /// the first time a `topic_id` is seen, we open it. SUMMARY closes it.
     fn update_topic(&mut self, msg: &AgentMessage) {
-        let is_new = !self.topics.contains_key(&msg.topic_id);
-        if is_new {
-            // Title source priority (Sprint 2.6):
-            //   1. The agent's explicit `opens_topic_title` on this message
-            //   2. The latest message's payload (only meaningful for the first
-            //      message of a topic — UserInput, Broadcast, ASK_AGENT, etc.)
-            //   3. Fallback to the topic_id itself (ugly but never undefined)
-            let title = msg
-                .opens_topic_title
-                .clone()
-                .or_else(|| derive_title_from_first_message(msg))
-                .unwrap_or_else(|| msg.topic_id.clone());
-            self.topics.insert(
-                msg.topic_id.clone(),
-                Topic::open(msg.topic_id.clone(), title, msg.timestamp),
-            );
-            tracing::info!(
-                target: "aidock::dispatcher",
-                topic = %msg.topic_id,
-                title = %self.topics[&msg.topic_id].title,
-                "topic opened"
-            );
-        }
-
-        let topic = self
-            .topics
-            .get_mut(&msg.topic_id)
-            .expect("just inserted above if missing");
-        topic.add_participant(&msg.sender);
-
-        if let AgentMessageKind::Summary {
-            summary,
-            key_decisions,
-            ..
-        } = &msg.kind
-        {
-            topic.close(summary.clone(), key_decisions.clone(), msg.timestamp);
-            tracing::info!(
-                target: "aidock::dispatcher",
-                topic = %msg.topic_id,
-                "topic closed by SUMMARY"
-            );
-        }
+        apply_message_to_topics(&mut self.topics, msg);
     }
 
     async fn route(&self, msg: &AgentMessage) {
@@ -346,5 +403,143 @@ impl Dispatcher {
             .get(id)
             .map(|t| matches!(t.status, TopicStatus::Closed))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::message::AgentMessageKind;
+
+    fn make(id: &str, sender: &str, kind: AgentMessageKind) -> AgentMessage {
+        AgentMessage::new(id, sender, "t-1", 0, kind)
+    }
+
+    #[test]
+    fn filter_includes_own_emits() {
+        // Own messages must be in the visible stream — without this the
+        // Sprint 2.4 duplicate-ANSWER fix regresses after a restart.
+        let history = vec![make(
+            "m-1",
+            "PM",
+            AgentMessageKind::Broadcast {
+                content: "kick".into(),
+            },
+        )];
+        let visible = filter_visible_to(&history, "PM");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "m-1");
+    }
+
+    #[test]
+    fn filter_excludes_ask_directed_at_someone_else() {
+        let history = vec![make(
+            "m-1",
+            "PM",
+            AgentMessageKind::AskAgent {
+                to: "frontend_dev".into(),
+                content: "?".into(),
+                expected_format: None,
+            },
+        )];
+        // backend_dev wasn't the target and isn't the sender; they
+        // never saw this in their inbox at runtime, so reload must
+        // hide it too.
+        let visible = filter_visible_to(&history, "backend_dev");
+        assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn filter_includes_ask_directed_at_self() {
+        let history = vec![make(
+            "m-1",
+            "PM",
+            AgentMessageKind::AskAgent {
+                to: "frontend_dev".into(),
+                content: "?".into(),
+                expected_format: None,
+            },
+        )];
+        let visible = filter_visible_to(&history, "frontend_dev");
+        assert_eq!(visible.len(), 1);
+    }
+
+    #[test]
+    fn filter_includes_broadcast_from_others() {
+        let history = vec![make(
+            "m-1",
+            "PM",
+            AgentMessageKind::Broadcast {
+                content: "all hands".into(),
+            },
+        )];
+        let visible = filter_visible_to(&history, "frontend_dev");
+        assert_eq!(visible.len(), 1);
+        let visible = filter_visible_to(&history, "backend_dev");
+        assert_eq!(visible.len(), 1);
+    }
+
+    #[test]
+    fn filter_includes_user_input_for_everyone() {
+        let history = vec![make(
+            "m-u",
+            "user",
+            AgentMessageKind::UserInput { content: "hi".into() },
+        )];
+        for agent in ["PM", "frontend_dev", "backend_dev"] {
+            let visible = filter_visible_to(&history, agent);
+            assert_eq!(visible.len(), 1, "{agent} should see user input");
+        }
+    }
+
+    #[test]
+    fn apply_message_to_topics_opens_and_closes() {
+        let mut topics: HashMap<TopicId, Topic> = HashMap::new();
+        let m_open = make(
+            "m-1",
+            "PM",
+            AgentMessageKind::Broadcast {
+                content: "kicking off frontend".into(),
+            },
+        );
+        apply_message_to_topics(&mut topics, &m_open);
+        assert_eq!(topics.len(), 1);
+        let t = topics.get("t-1").unwrap();
+        assert!(t.is_active());
+        // Title falls back to first message's payload prefix when
+        // opens_topic_title is absent.
+        assert!(t.title.contains("kicking off"));
+
+        let m_close = AgentMessage::new(
+            "m-2",
+            "PM",
+            "t-1",
+            5,
+            AgentMessageKind::Summary {
+                topic_id: "t-1".into(),
+                summary: "done".into(),
+                key_decisions: vec!["a".into()],
+            },
+        );
+        apply_message_to_topics(&mut topics, &m_close);
+        let t = topics.get("t-1").unwrap();
+        assert!(matches!(t.status, TopicStatus::Closed));
+        assert_eq!(t.summary, "done");
+        assert_eq!(t.key_decisions, vec!["a"]);
+    }
+
+    #[test]
+    fn apply_message_respects_opens_topic_title() {
+        let mut topics: HashMap<TopicId, Topic> = HashMap::new();
+        let mut m = make(
+            "m-1",
+            "PM",
+            AgentMessageKind::Broadcast {
+                content: "lots of words about something".into(),
+            },
+        );
+        m.opens_topic_title = Some("Frontend stack pick".into());
+        apply_message_to_topics(&mut topics, &m);
+        assert_eq!(topics["t-1"].title, "Frontend stack pick");
     }
 }

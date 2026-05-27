@@ -11,9 +11,12 @@
 //! the session ends the scratchpad evaporates. Sprint 3 will serialize to
 //! `sessions/{id}/scratchpads/{role}.json` for cross-session persistence.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::agent::persistence::{atomic_write_json, read_json};
 use crate::llm::Tool;
 
 pub const TOOL_UPDATE_SCRATCHPAD: &str = "update_scratchpad";
@@ -37,6 +40,34 @@ pub struct Scratchpad {
 pub struct FileChange {
     pub path: String,
     pub note: String,
+}
+
+impl Scratchpad {
+    /// Persist to disk via atomic_write_json. Sprint 3 — agent runtime
+    /// calls this after every successful update so a crash never loses
+    /// more than the in-flight LLM call.
+    pub fn save(&self, path: &Path) -> Result<(), crate::agent::persistence::PersistError> {
+        atomic_write_json(path, self)
+    }
+
+    /// Load from disk. Returns `Default` on missing/corrupt — Sprint 3
+    /// deliberately never refuses to start an agent because of a broken
+    /// scratchpad file; the agent gets a fresh notepad and we log loudly.
+    pub fn load(path: &Path) -> Self {
+        match read_json::<Scratchpad>(path) {
+            Ok(Some(pad)) => pad,
+            Ok(None) => Scratchpad::default(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "aidock::scratchpad",
+                    path = %path.display(),
+                    error = %e,
+                    "could not load scratchpad — starting fresh"
+                );
+                Scratchpad::default()
+            }
+        }
+    }
 }
 
 pub fn is_scratchpad_tool(name: &str) -> bool {

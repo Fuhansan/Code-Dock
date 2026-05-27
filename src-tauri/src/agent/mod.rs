@@ -14,6 +14,7 @@
 pub mod context;
 pub mod dispatcher;
 pub mod message;
+pub mod persistence;
 pub mod protocol;
 pub mod recall;
 pub mod role;
