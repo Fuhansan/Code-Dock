@@ -15,6 +15,7 @@ pub mod approval;
 pub mod context;
 pub mod dispatcher;
 pub mod mcp;
+pub mod mcp_log;
 pub mod message;
 pub mod persistence;
 pub mod protocol;

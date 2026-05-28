@@ -25,7 +25,7 @@ use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -46,7 +46,7 @@ pub const MCP_CALL_EVENT: &str = "aidock:mcp_call";
 /// What the front-end sees for one MCP tool execution. Lightweight by
 /// design — args / result are truncated previews, full audit lives in
 /// tracing logs.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpCallEvent {
     /// Stable id for de-duplication on the frontend if needed.
     pub id: String,

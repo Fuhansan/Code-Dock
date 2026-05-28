@@ -50,6 +50,7 @@ use crate::agent::dispatcher::DispatcherHandle;
 use crate::agent::mcp::{
     make_call_event, truncate, McpClient, MCP_CALL_EVENT, MCP_PREVIEW_MAX, MCP_TOOL_PREFIX,
 };
+use crate::agent::mcp_log::McpLogHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
@@ -171,6 +172,10 @@ pub struct AgentBoot {
     /// approval-request event; the `respond_to_approval` Tauri command
     /// fulfils the channel.
     pub pending_approvals: PendingApprovals,
+    /// Sprint 4 polish: cheap-clone handle into the mpsc writer task that
+    /// appends each MCP call to `mcp_calls.jsonl`. `None` for headless
+    /// harnesses that don't need a persistence path.
+    pub mcp_log: Option<McpLogHandle>,
 }
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
@@ -193,6 +198,7 @@ async fn run_agent(boot: AgentBoot) {
         app_handle,
         approval,
         pending_approvals,
+        mcp_log,
     } = boot;
 
     // Pre-compute the full tool list once per agent (MCP tools are static
@@ -397,9 +403,10 @@ async fn run_agent(boot: AgentBoot) {
                     };
                     // Sprint 4.5: surface this call to the chat panel
                     // even if it failed — users want to see the attempt,
-                    // not just the success.
+                    // not just the success. ALSO append to mcp_calls.jsonl
+                    // so reload doesn't lose tool-call history.
+                    let event = make_call_event(&role.id, name, args, &body, now_ms());
                     if let Some(handle) = app_handle.as_ref() {
-                        let event = make_call_event(&role.id, name, args, &body, now_ms());
                         if let Err(e) = handle.emit(MCP_CALL_EVENT, &event) {
                             tracing::warn!(
                                 target: "aidock::agent",
@@ -408,6 +415,9 @@ async fn run_agent(boot: AgentBoot) {
                                 "failed to emit MCP call event"
                             );
                         }
+                    }
+                    if let Some(log) = mcp_log.as_ref() {
+                        log.record(event).await;
                     }
                     body
                 } else {

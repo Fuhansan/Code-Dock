@@ -10,6 +10,8 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::agent::approval::{new_pending_approvals, ApprovalRegistry, Decision, PendingApprovals};
+use crate::agent::mcp::McpCallEvent;
+use crate::agent::mcp_log::{read_mcp_calls, MCP_LOG_FILE};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
 use crate::agent::{Session, SessionError};
@@ -234,4 +236,18 @@ pub async fn load_message_history() -> Result<Vec<AgentMessage>, CommandError> {
         )))
     })?;
     Ok(msgs)
+}
+
+/// Sprint 4 polish: like `load_message_history` but for the MCP-call log
+/// so reloaded sessions can show prior tool-call cards too, not just
+/// messages.
+#[tauri::command]
+pub async fn load_mcp_call_history() -> Result<Vec<McpCallEvent>, CommandError> {
+    let path = default_session_dir().join(MCP_LOG_FILE);
+    let calls = read_mcp_calls(&path).map_err(|e| {
+        CommandError::Llm(LLMError::Other(format!(
+            "could not load MCP call history: {e}"
+        )))
+    })?;
+    Ok(calls)
 }

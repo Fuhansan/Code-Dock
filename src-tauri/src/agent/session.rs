@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use crate::agent::approval::{ApprovalRegistry, PendingApprovals};
 use crate::agent::dispatcher::{filter_visible_to, Dispatcher, DispatcherError, DispatcherHandle};
 use crate::agent::mcp::{McpClient, McpError};
+use crate::agent::mcp_log::{spawn_writer as spawn_mcp_log_writer, McpLogHandle, MCP_LOG_FILE};
 use crate::agent::message::{AgentMessage, TopicId};
 use crate::agent::roles::default_workshop;
 use crate::agent::runtime::{spawn_agent, user_input_message, AgentBoot};
@@ -49,6 +50,9 @@ pub struct Session {
     // session's lifetime and stop when their channels close.
     _dispatcher_task: JoinHandle<()>,
     _agent_tasks: Vec<JoinHandle<()>>,
+    /// Sprint 4 polish: MCP-call log writer task. Lives for the session's
+    /// lifetime; drops cleanly when the last `McpLogHandle` clone goes.
+    _mcp_log_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +67,8 @@ pub enum SessionError {
         #[source]
         source: std::io::Error,
     },
+    #[error("mcp log setup: {0}")]
+    McpLog(#[source] std::io::Error),
 }
 
 /// Ensure `session_dir/workspace/` exists and return its canonical path.
@@ -129,6 +135,14 @@ impl Session {
 
         let scratchpad_dir = session_dir.join("scratchpads");
         let workspace_dir = ensure_workspace_dir(&session_dir).await?;
+        let mcp_log_path = session_dir.join(MCP_LOG_FILE);
+
+        // Sprint 4 polish: spawn the MCP-call log writer task. Each agent
+        // gets a cheap-clone handle into its mpsc channel.
+        let (mcp_log_handle, mcp_log_task) = spawn_mcp_log_writer(mcp_log_path)
+            .await
+            .map(|(h, t)| (Some(h), Some(t)))
+            .map_err(SessionError::McpLog)?;
 
         // Sprint 4.2: spawn filesystem MCP server. Best-effort — on
         // failure agents simply have no filesystem tools available.
@@ -189,6 +203,7 @@ impl Session {
                 app_handle: app_handle_for_agents.clone(),
                 approval: approval.clone(),
                 pending_approvals: pending_approvals.clone(),
+                mcp_log: mcp_log_handle.clone(),
             };
             agent_tasks.push(spawn_agent(boot));
         }
@@ -207,6 +222,7 @@ impl Session {
             handle,
             _dispatcher_task: dispatcher_task,
             _agent_tasks: agent_tasks,
+            _mcp_log_task: mcp_log_task,
         })
     }
 

@@ -179,3 +179,9 @@ export function sendUserMessage(content: string, topic_id?: string): Promise<voi
 export function loadMessageHistory(): Promise<AgentMessage[]> {
   return invoke('load_message_history');
 }
+
+/** Sprint 4 polish: like loadMessageHistory but for the MCP tool-call
+ *  log, so reloaded sessions show prior tool-call cards too. */
+export function loadMcpCallHistory(): Promise<McpCallEvent[]> {
+  return invoke('load_mcp_call_history');
+}

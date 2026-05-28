@@ -9,6 +9,7 @@
     sendUserMessage,
     sessionStatus,
     loadMessageHistory,
+    loadMcpCallHistory,
     respondToApproval,
     type AgentMessage,
     type AgentMessageKind,
@@ -130,16 +131,26 @@
   }
 
   onMount(async () => {
-    // Sprint 3: load persisted history FIRST so the user sees prior turns
-    // immediately after a restart, before any live events arrive.
+    // Sprint 3 + Sprint 4 polish: load BOTH persisted streams (messages
+    // and MCP calls) FIRST so the user sees prior turns + prior tool
+    // calls immediately after a restart, before any live events arrive.
     try {
-      const history = await loadMessageHistory();
+      const [history, mcpHistory] = await Promise.all([
+        loadMessageHistory(),
+        loadMcpCallHistory().catch((e) => {
+          console.warn('load mcp history failed:', e);
+          return [] as McpCallEvent[];
+        })
+      ]);
       const initial: TimelineItem[] = [];
       for (const m of history) {
         if (m.opens_topic_title && !topicTitles[m.topic_id]) {
           topicTitles[m.topic_id] = m.opens_topic_title;
         }
         initial.push({ kind: 'message', ts: m.timestamp, data: m });
+      }
+      for (const e of mcpHistory) {
+        initial.push({ kind: 'mcp', ts: e.timestamp, data: e });
       }
       initial.sort((a, b) => a.ts - b.ts);
       timeline = initial;
