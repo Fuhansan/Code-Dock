@@ -54,6 +54,31 @@ impl Default for LoopMode {
     }
 }
 
+/// Which subset of filesystem MCP tools is advertised to this role. The
+/// runtime filters tools BEFORE the LLM ever sees them, so an agent
+/// without `None`-grade access literally cannot pick fs__write_file from
+/// its toolbox.
+///
+/// Sprint 4 design pivot: feedback from the first GUI run was that PM
+/// happily wrote files himself instead of delegating, even with a "you
+/// are not a coder" prompt rule. The correct fix is structural — don't
+/// hand PM the hammer in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAccess {
+    /// No MCP tools advertised. The agent gets only message + query +
+    /// scratchpad tools. Right default for coordinator-shaped roles.
+    #[default]
+    None,
+    /// Read-only filesystem tools (list / read / search / get_file_info).
+    /// Lets an agent inspect the workspace without being able to mutate
+    /// it. Useful for QA / review roles in future workshops.
+    ReadOnly,
+    /// Everything — read, write, edit, move, create_directory. Reserved
+    /// for engineering-shaped roles.
+    All,
+}
+
 /// Full role definition. The runtime reads this; the workshop editor (Sprint
 /// V0.3) will eventually write it. For V0.1 these are hardcoded in 2.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +111,11 @@ pub struct RoleConfig {
     /// Reserved for Sprint 2.5 context-builder caps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_history_tokens: Option<u32>,
+
+    /// What slice of filesystem MCP tools (if any) this role can call.
+    /// Defaults to `None` — opt-in tool access, opt-out by omission.
+    #[serde(default)]
+    pub mcp_access: McpAccess,
 }
 
 #[cfg(test)]
@@ -121,10 +151,18 @@ mod tests {
             teammates: vec!["frontend_dev".into()],
             loop_mode: LoopMode::default(),
             max_history_tokens: None,
+            mcp_access: McpAccess::default(),
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["id"], "PM");
         assert_eq!(v["model"]["provider"], "bailian");
         assert_eq!(v["loop_mode"], "single");
+        // Default mcp_access is None — coordinator-shaped roles must opt in.
+        assert_eq!(v["mcp_access"], "none");
+    }
+
+    #[test]
+    fn mcp_access_default_is_none() {
+        assert_eq!(McpAccess::default(), McpAccess::None);
     }
 }

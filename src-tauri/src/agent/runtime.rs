@@ -41,9 +41,10 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use crate::agent::approval::{
-    classify, ApprovalRegistry, ApprovalRequest, Decision, LookupResult, PendingApprovals,
+    classify, ApprovalRegistry, ApprovalRequest, Danger, Decision, LookupResult, PendingApprovals,
     APPROVAL_REQUEST_EVENT, APPROVAL_TIMEOUT_SECS,
 };
+use crate::agent::role::McpAccess;
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
 use crate::agent::mcp::{
@@ -52,7 +53,7 @@ use crate::agent::mcp::{
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
-use crate::agent::role::RoleConfig;
+use crate::agent::role::{McpAccess as RoleMcpAccess, RoleConfig};
 use crate::agent::roles::PM_ID;
 use crate::agent::scratchpad::{
     apply_update as apply_scratchpad_update, is_scratchpad_tool, scratchpad_tools, Scratchpad,
@@ -104,14 +105,33 @@ fn is_terminal_message_kind(kind: &AgentMessageKind) -> bool {
 }
 
 /// All tools advertised on every LLM call: action message tools + query
-/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8) + MCP filesystem
-/// tools (Sprint 4) if the session has an MCP client up.
-fn build_all_tools(mcp: Option<&McpClient>) -> Vec<Tool> {
+/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8) + the slice of MCP
+/// filesystem tools the role's `mcp_access` permits (Sprint 4 + the role-
+/// scoping refinement after the first GUI run).
+///
+/// Filtering BEFORE advertising is deliberate: the model literally can't
+/// pick what it isn't shown. PM can't accidentally write code when only
+/// engineers see `fs__write_file`.
+fn build_all_tools(mcp: Option<&McpClient>, access: RoleMcpAccess) -> Vec<Tool> {
     let mut tools = message_tools();
     tools.extend(query_tools());
     tools.extend(scratchpad_tools());
+
+    if matches!(access, RoleMcpAccess::None) {
+        return tools;
+    }
+
     if let Some(client) = mcp {
-        tools.extend(client.advertised_tools().iter().cloned());
+        for t in client.advertised_tools() {
+            let allowed = match access {
+                RoleMcpAccess::All => true,
+                RoleMcpAccess::ReadOnly => matches!(classify(&t.function.name), Danger::ReadOnly),
+                RoleMcpAccess::None => unreachable!("None short-circuited above"),
+            };
+            if allowed {
+                tools.push(t.clone());
+            }
+        }
     }
     tools
 }
@@ -175,18 +195,20 @@ async fn run_agent(boot: AgentBoot) {
         pending_approvals,
     } = boot;
 
+    // Pre-compute the full tool list once per agent (MCP tools are static
+    // across the session — server's tool catalog doesn't change, role's
+    // mcp_access doesn't change either).
+    let tools = build_all_tools(mcp.as_ref(), role.mcp_access);
+
     tracing::info!(
         target: "aidock::agent",
         role = %role.id,
         recovered_msgs = initial_history.len(),
         state = initial_state.tag(),
-        mcp_tools = mcp.as_ref().map(|m| m.advertised_tools().len()).unwrap_or(0),
+        mcp_access = ?role.mcp_access,
+        advertised_tools = tools.len(),
         "agent task started"
     );
-
-    // Pre-compute the full tool list once per agent (MCP tools are static
-    // across the session — server's tool catalog doesn't change).
-    let tools = build_all_tools(mcp.as_ref());
 
     let provider = BailianProvider::new(api_key);
     let mut state = initial_state;

@@ -16,7 +16,7 @@ use crate::agent::protocol::{
     TOOL_ANSWER, TOOL_ASK_AGENT, TOOL_BROADCAST, TOOL_DONE, TOOL_PROGRESS, TOOL_SUMMARY,
     TOOL_WORK_START,
 };
-use crate::agent::role::{Budget, LoopMode, ModelConfig, RoleConfig};
+use crate::agent::role::{Budget, LoopMode, McpAccess, ModelConfig, RoleConfig};
 
 pub const PM_ID: &str = "PM";
 pub const FRONTEND_ID: &str = "frontend_dev";
@@ -136,6 +136,10 @@ pub fn pm_role() -> RoleConfig {
         teammates: vec![FRONTEND_ID.into(), BACKEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
+        // PM coordinates, doesn't code. No filesystem access at all —
+        // the model literally won't see fs__ tools advertised, so it
+        // can't accidentally write code that's the engineers' job.
+        mcp_access: McpAccess::None,
     }
 }
 
@@ -171,6 +175,9 @@ pub fn frontend_role() -> RoleConfig {
         teammates: vec![PM_ID.into(), BACKEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
+        // Engineers need full filesystem access — read existing code,
+        // write new files, edit, organise.
+        mcp_access: McpAccess::All,
     }
 }
 
@@ -206,6 +213,9 @@ pub fn backend_role() -> RoleConfig {
         teammates: vec![PM_ID.into(), FRONTEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
+        // Same rationale as frontend: engineering roles get full
+        // filesystem access.
+        mcp_access: McpAccess::All,
     }
 }
 
