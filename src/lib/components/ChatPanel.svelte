@@ -256,6 +256,62 @@
   function decisionsOf(kind: AgentMessageKind): string[] {
     return kind.type === 'SUMMARY' ? kind.key_decisions : [];
   }
+
+  // Sprint 4.5 polish: render MCP calls in a Claude Code-ish style —
+  // `● tool(key_arg)` + indented `⎿  short summary`. Verbose args are
+  // available on hover via the `title` attribute so the user can still
+  // see the full payload when needed.
+
+  function shortTool(t: string): string {
+    return t.replace(/^fs__/, '');
+  }
+
+  /** Try to extract the most relevant single argument for display.
+   *  Most filesystem tools take a `path`; search tools take a `query`.
+   *  Falls back to empty when args_preview was truncated mid-quote. */
+  function keyArg(toolName: string, argsPreview: string): string {
+    // Path-style tools (everything that touches a file or directory).
+    const pathMatch = argsPreview.match(/"path"\s*:\s*"([^"]+)"/);
+    if (pathMatch) return basename(pathMatch[1]);
+    // search_files / search_topic-style
+    const queryMatch = argsPreview.match(/"(?:query|pattern)"\s*:\s*"([^"]+)"/);
+    if (queryMatch) return queryMatch[1];
+    // move_file uses source/destination
+    const srcMatch = argsPreview.match(/"source"\s*:\s*"([^"]+)"/);
+    if (srcMatch) return basename(srcMatch[1]);
+    return '';
+  }
+
+  function basename(p: string): string {
+    const idx = p.lastIndexOf('/');
+    const name = idx >= 0 ? p.slice(idx + 1) : p;
+    return name || p; // handle trailing slash
+  }
+
+  /** Compact one-line result summary. Distinguishes denied / errored /
+   *  successful, and pulls a useful number out of the body when possible
+   *  (bytes written, file count, line count). */
+  function resultSummary(call: McpCallEvent): string {
+    const r = call.result_preview.trim();
+    if (r.startsWith('DENIED:')) return r;
+    if (r.startsWith('ERROR:')) {
+      // Strip ERROR prefix + take the first short reason line.
+      const tail = r.slice('ERROR:'.length).trim();
+      return tail.split('\n')[0].slice(0, 80);
+    }
+    // Successful — pick a representative one-liner.
+    // "Successfully wrote to /path" → "wrote /path"
+    const wrote = r.match(/Successfully wrote to (\S+)/);
+    if (wrote) return `wrote ${basename(wrote[1])}`;
+    // Numbered counts ("3 files in directory", "12 matches", ...)
+    const counted = r.match(/^(\d+)\s+(\w[\w ]*)/);
+    if (counted) return `${counted[1]} ${counted[2]}`;
+    // Allowed dirs result starts with "Allowed directories:"
+    if (r.startsWith('Allowed directories')) return 'allowed dirs listed';
+    // Fallback: first line, truncated.
+    const first = r.split('\n')[0];
+    return first.length > 80 ? first.slice(0, 80) + '…' : first;
+  }
 </script>
 
 <div class="chat-panel">
@@ -316,19 +372,25 @@
         <div class="mcp-card" style:--accent={s.color}>
           <div class="mcp-head">
             <span class="mcp-agent" style:color={s.color}>{s.label}</span>
-            <span class="mcp-summary">
-              🔧 {item.calls.length} 次工具调用{#if errCount > 0} · <span class="mcp-err-count">{errCount} 失败</span>{/if}
+            <span class="mcp-headline">
+              {item.calls.length} 次工具调用{#if errCount > 0} · <span class="mcp-err-count">{errCount} 失败</span>{/if}
             </span>
           </div>
           <ul class="mcp-list">
             {#each item.calls as c (c.id)}
-              <li class="mcp-row" class:err={!c.success}>
-                <div class="mcp-row-head">
-                  <span class="mcp-tool">{c.tool}</span>
-                  {#if !c.success}<span class="mcp-badge">ERR</span>{/if}
+              {@const arg = keyArg(c.tool, c.args_preview)}
+              <li class="mcp-row" class:err={!c.success} title={c.args_preview}>
+                <div class="mcp-line">
+                  <span class="mcp-bullet">●</span>
+                  <span class="mcp-name">{shortTool(c.tool)}</span>
+                  {#if arg}
+                    <span class="mcp-arg">({arg})</span>
+                  {/if}
                 </div>
-                <div class="mcp-args">{c.args_preview}</div>
-                <div class="mcp-result">{c.result_preview}</div>
+                <div class="mcp-line mcp-result-line">
+                  <span class="mcp-elbow">⎿</span>
+                  <span class="mcp-result">{resultSummary(c)}</span>
+                </div>
               </li>
             {/each}
           </ul>
@@ -669,8 +731,9 @@
     background: #2aa849;
   }
 
-  /* Sprint 4.5 — MCP tool-call cards (one card per agent's consecutive
-     activity, sub-lines for each call) */
+  /* Sprint 4.5 — MCP tool-call cards. Claude-Code-ish compact rows:
+     "● tool(arg)" + indented "⎿ result". Verbose args available on
+     hover via the row's title attribute. */
   .mcp-card {
     align-self: stretch;
     border-left: 3px solid var(--accent, #c7c7cc);
@@ -681,13 +744,14 @@
     line-height: 1.45;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
     margin-left: 4px;
   }
   .mcp-head {
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-bottom: 2px;
   }
   .mcp-agent {
     font-size: 11px;
@@ -695,8 +759,8 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  .mcp-summary {
-    font-size: 12px;
+  .mcp-headline {
+    font-size: 11px;
     color: #6e6e73;
   }
   .mcp-err-count {
@@ -709,50 +773,46 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 1px;
   }
   .mcp-row {
-    padding: 6px 8px;
-    border-radius: 6px;
-    background: #ffffff;
-    border-left: 2px solid #d2d2d7;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+    padding: 2px 0;
+    cursor: default;
   }
-  .mcp-row.err {
-    background: #fff7f6;
-    border-left-color: #ff3b30;
-  }
-  .mcp-row-head {
+  .mcp-line {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
-  }
-  .mcp-tool {
     font-family: 'SF Mono', Menlo, monospace;
     font-size: 12px;
-    font-weight: 500;
+    line-height: 1.5;
     color: #1c1c1e;
   }
-  .mcp-badge {
+  .mcp-bullet {
+    color: var(--accent, #6e6e73);
     font-size: 10px;
-    background: #ff3b30;
-    color: #fff;
-    padding: 1px 6px;
-    border-radius: 3px;
-    letter-spacing: 0.04em;
+    line-height: 1;
+    align-self: center;
   }
-  .mcp-args,
-  .mcp-result {
-    font-family: 'SF Mono', Menlo, monospace;
-    font-size: 11px;
+  .mcp-row.err .mcp-bullet {
+    color: #ff3b30;
+  }
+  .mcp-name {
+    font-weight: 500;
+  }
+  .mcp-arg {
     color: #6e6e73;
-    white-space: pre-wrap;
-    word-break: break-word;
   }
-  .mcp-result {
-    color: #1c1c1e;
+  .mcp-result-line {
+    color: #6e6e73;
+    padding-left: 10px;
+  }
+  .mcp-elbow {
+    color: #c7c7cc;
+    margin-right: 2px;
+  }
+  .mcp-row.err .mcp-result {
+    color: #ff3b30;
   }
   .decisions {
     margin: 4px 0 0 0;
@@ -858,25 +918,23 @@
     .mcp-card {
       background: #2c2c2e;
     }
-    .mcp-row {
-      background: #1c1c1e;
-      border-left-color: #38383a;
-    }
-    .mcp-row.err {
-      background: #3a1f1d;
-      border-left-color: #ff3b30;
-    }
-    .mcp-tool {
+    .mcp-line {
       color: #f5f5f7;
     }
-    .mcp-args {
+    .mcp-arg {
       color: #8e8e93;
     }
-    .mcp-result {
-      color: #d1d1d6;
+    .mcp-result-line {
+      color: #8e8e93;
     }
-    .mcp-summary {
+    .mcp-elbow {
+      color: #48484a;
+    }
+    .mcp-headline {
       color: #98989d;
+    }
+    .mcp-row.err .mcp-result {
+      color: #ff6961;
     }
     .topic-title {
       color: #f5f5f7;
