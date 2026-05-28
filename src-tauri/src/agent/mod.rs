@@ -11,6 +11,7 @@
 //! - `context` — Level 0 prompt builder (Sprint 2.5)
 //! - `scratchpad` — per-Agent working memory (Sprint 2.8)
 
+pub mod approval;
 pub mod context;
 pub mod dispatcher;
 pub mod mcp;

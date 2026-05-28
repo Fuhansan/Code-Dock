@@ -92,7 +92,9 @@ pub fn make_call_event(
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Multibyte-safe truncation. Pub so the approval gate (Sprint 4.6) can
+/// reuse the same rule for its prompts.
+pub fn truncate(s: &str, max: usize) -> String {
     // `chars()` keeps us at code-point boundaries — `s[..max]` would
     // panic on multibyte text (Chinese tool args, etc).
     if s.chars().count() <= max {

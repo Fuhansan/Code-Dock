@@ -44,6 +44,7 @@ pub fn run() {
             commands::session_status,
             commands::send_user_message,
             commands::load_message_history,
+            commands::respond_to_approval,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use aidock_lib::agent::approval::{new_pending_approvals, ApprovalRegistry};
 use aidock_lib::agent::Session;
 use aidock_lib::keyring_store;
 use serde_json::Value;
@@ -54,7 +55,17 @@ async fn main() -> anyhow::Result<()> {
     println!("└─");
     println!();
 
-    let session = Session::start(session_dir.clone(), api_key, None).await?;
+    // Headless: pass empty approval state. With app_handle = None the
+    // runtime skips the approval gate entirely anyway, so this is just
+    // bookkeeping.
+    let session = Session::start(
+        session_dir.clone(),
+        api_key,
+        None,
+        ApprovalRegistry::new(),
+        new_pending_approvals(),
+    )
+    .await?;
 
     session
         .submit_user_input(SCENARIO.to_string(), None)

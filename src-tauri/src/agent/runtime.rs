@@ -35,11 +35,20 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use tauri::Emitter;
+use std::time::Duration;
 
+use tauri::Emitter;
+use tokio::sync::oneshot;
+
+use crate::agent::approval::{
+    classify, ApprovalRegistry, ApprovalRequest, Decision, LookupResult, PendingApprovals,
+    APPROVAL_REQUEST_EVENT, APPROVAL_TIMEOUT_SECS,
+};
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
-use crate::agent::mcp::{make_call_event, McpClient, MCP_CALL_EVENT, MCP_TOOL_PREFIX};
+use crate::agent::mcp::{
+    make_call_event, truncate, McpClient, MCP_CALL_EVENT, MCP_PREVIEW_MAX, MCP_TOOL_PREFIX,
+};
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
 use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
@@ -134,6 +143,14 @@ pub struct AgentBoot {
     /// (Sprint 4.5). `None` in headless dev harnesses; the runtime
     /// silently skips emission when absent.
     pub app_handle: Option<tauri::AppHandle>,
+    /// Sprint 4.6: per-session approval state for destructive MCP calls.
+    /// Cheap to clone (internal Arc).
+    pub approval: ApprovalRegistry,
+    /// Sprint 4.6: map of in-flight approval requests, keyed by request id.
+    /// The runtime registers a oneshot sender here before emitting the
+    /// approval-request event; the `respond_to_approval` Tauri command
+    /// fulfils the channel.
+    pub pending_approvals: PendingApprovals,
 }
 
 /// Spawn one Agent task. The returned `JoinHandle` lets the session
@@ -154,6 +171,8 @@ async fn run_agent(boot: AgentBoot) {
         scratchpad_path,
         mcp,
         app_handle,
+        approval,
+        pending_approvals,
     } = boot;
 
     tracing::info!(
@@ -299,33 +318,60 @@ async fn run_agent(boot: AgentBoot) {
                         Err(e) => format!("scratchpad update failed: {e}"),
                     }
                 } else if is_mcp_tool(name) {
-                    let body = match mcp.as_ref() {
-                        Some(client) => match client.call_tool(name, args).await {
-                            Ok(body) => {
-                                tracing::info!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    tool = %name,
-                                    iter,
-                                    body_len = body.len(),
-                                    "MCP tool returned"
-                                );
-                                body
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    tool = %name,
-                                    error = %e,
-                                    "MCP tool call failed"
-                                );
-                                format!("MCP tool '{name}' failed: {e}")
-                            }
+                    // Sprint 4.6: gate destructive tools. Skipped entirely
+                    // in headless mode (no app_handle = no one to ask).
+                    let approval_outcome = if app_handle.is_some() {
+                        gate_mcp_call(
+                            &role.id,
+                            name,
+                            args,
+                            &approval,
+                            &pending_approvals,
+                            app_handle.as_ref(),
+                        )
+                        .await
+                    } else {
+                        ApprovalOutcome::Proceed
+                    };
+
+                    let body = match approval_outcome {
+                        ApprovalOutcome::Rejected(reason) => {
+                            tracing::info!(
+                                target: "aidock::agent",
+                                role = %role.id,
+                                tool = %name,
+                                "MCP call denied by user/policy"
+                            );
+                            format!("DENIED: {reason}")
+                        }
+                        ApprovalOutcome::Proceed => match mcp.as_ref() {
+                            Some(client) => match client.call_tool(name, args).await {
+                                Ok(body) => {
+                                    tracing::info!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        tool = %name,
+                                        iter,
+                                        body_len = body.len(),
+                                        "MCP tool returned"
+                                    );
+                                    body
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "aidock::agent",
+                                        role = %role.id,
+                                        tool = %name,
+                                        error = %e,
+                                        "MCP tool call failed"
+                                    );
+                                    format!("MCP tool '{name}' failed: {e}")
+                                }
+                            },
+                            None => format!(
+                                "MCP tool '{name}' is not available — the filesystem server didn't start this session"
+                            ),
                         },
-                        None => format!(
-                            "MCP tool '{name}' is not available — the filesystem server didn't start this session"
-                        ),
                     };
                     // Sprint 4.5: surface this call to the chat panel
                     // even if it failed — users want to see the attempt,
@@ -524,6 +570,125 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Result of the approval gate for one MCP tool call.
+enum ApprovalOutcome {
+    /// Either the tool was read-only, a prior decision approved, or the
+    /// user explicitly approved this request.
+    Proceed,
+    /// The user rejected, a prior decision rejected, or the request
+    /// timed out. `reason` is the string surfaced to the LLM as the
+    /// tool result body.
+    Rejected(String),
+}
+
+/// Run one tool through the approval gate. Returns immediately for
+/// read-only / pre-approved tools; awaits a user response (via oneshot
+/// channel) for unknowns, with a hard timeout.
+async fn gate_mcp_call(
+    agent: &str,
+    tool: &str,
+    raw_args: &str,
+    registry: &ApprovalRegistry,
+    pending: &PendingApprovals,
+    app_handle: Option<&tauri::AppHandle>,
+) -> ApprovalOutcome {
+    match registry.lookup(agent, tool).await {
+        LookupResult::NoGate | LookupResult::Approved => return ApprovalOutcome::Proceed,
+        LookupResult::Rejected => {
+            return ApprovalOutcome::Rejected(format!(
+                "user previously rejected '{tool}' in this session"
+            ));
+        }
+        LookupResult::AskUser => {}
+    }
+
+    let id = format!("appr-{}", Uuid::new_v4());
+    let (tx, rx) = oneshot::channel::<Decision>();
+    pending.lock().await.insert(id.clone(), tx);
+
+    let req = ApprovalRequest {
+        id: id.clone(),
+        agent: agent.to_string(),
+        tool: tool.to_string(),
+        args_preview: truncate(raw_args, MCP_PREVIEW_MAX),
+        timestamp: now_ms(),
+        danger: classify(tool),
+    };
+
+    if let Some(handle) = app_handle {
+        if let Err(e) = handle.emit(APPROVAL_REQUEST_EVENT, &req) {
+            // Couldn't reach the UI — drop the pending entry and reject.
+            pending.lock().await.remove(&id);
+            tracing::error!(
+                target: "aidock::agent",
+                error = %e,
+                agent,
+                tool,
+                "approval request emit failed; auto-rejecting"
+            );
+            return ApprovalOutcome::Rejected(format!(
+                "couldn't reach UI to ask permission: {e}"
+            ));
+        }
+    } else {
+        // Defensive — gate_mcp_call shouldn't be called without a
+        // handle in headless mode, but if it is, auto-reject so we
+        // never block forever.
+        pending.lock().await.remove(&id);
+        return ApprovalOutcome::Rejected(
+            "no UI available to request approval".to_string(),
+        );
+    }
+
+    tracing::info!(
+        target: "aidock::agent",
+        agent,
+        tool,
+        request_id = %id,
+        "awaiting user approval"
+    );
+
+    let decision = match tokio::time::timeout(
+        Duration::from_secs(APPROVAL_TIMEOUT_SECS),
+        rx,
+    )
+    .await
+    {
+        Ok(Ok(d)) => d,
+        Ok(Err(_)) => {
+            // Sender dropped without firing — treat as rejection.
+            tracing::warn!(
+                target: "aidock::agent",
+                agent,
+                tool,
+                request_id = %id,
+                "approval sender dropped; auto-rejecting"
+            );
+            Decision::Reject
+        }
+        Err(_) => {
+            pending.lock().await.remove(&id);
+            tracing::warn!(
+                target: "aidock::agent",
+                agent,
+                tool,
+                request_id = %id,
+                timeout_s = APPROVAL_TIMEOUT_SECS,
+                "approval timed out; auto-rejecting"
+            );
+            Decision::Reject
+        }
+    };
+
+    registry.remember(agent, tool, decision).await;
+
+    if decision.allows_execution() {
+        ApprovalOutcome::Proceed
+    } else {
+        ApprovalOutcome::Rejected("user rejected this tool call".to_string())
+    }
 }
 
 /// Build an inbound message representing a user line. Exposed so the Tauri

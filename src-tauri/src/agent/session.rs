@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
+use crate::agent::approval::{ApprovalRegistry, PendingApprovals};
 use crate::agent::dispatcher::{filter_visible_to, Dispatcher, DispatcherError, DispatcherHandle};
 use crate::agent::mcp::{McpClient, McpError};
 use crate::agent::message::{AgentMessage, TopicId};
@@ -116,6 +117,8 @@ impl Session {
         session_dir: PathBuf,
         api_key: String,
         app_handle: Option<tauri::AppHandle>,
+        approval: ApprovalRegistry,
+        pending_approvals: PendingApprovals,
     ) -> Result<Self, SessionError> {
         // Clone before move-into-dispatcher so we can also hand it to
         // each agent runtime for MCP call-event emission (Sprint 4.5).
@@ -184,6 +187,8 @@ impl Session {
                 scratchpad_path,
                 mcp: mcp.clone(),
                 app_handle: app_handle_for_agents.clone(),
+                approval: approval.clone(),
+                pending_approvals: pending_approvals.clone(),
             };
             agent_tasks.push(spawn_agent(boot));
         }

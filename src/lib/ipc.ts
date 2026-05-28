@@ -88,6 +88,28 @@ export const MESSAGE_EVENT = 'aidock:message';
  *  (Sprint 4.5). One event per call, success or error. */
 export const MCP_CALL_EVENT = 'aidock:mcp_call';
 
+/** Sprint 4.6: emitted when the agent runtime needs the user's vote on
+ *  a destructive tool call. Frontend should respond via `respondToApproval`. */
+export const APPROVAL_REQUEST_EVENT = 'aidock:approval_request';
+
+export type DangerLevel = 'read_only' | 'mutating' | 'destructive';
+export type ApprovalDecision = 'allow_once' | 'allow_session' | 'reject';
+
+export interface ApprovalRequest {
+  id: string;
+  agent: string;
+  tool: string;
+  args_preview: string;
+  /** Unix milliseconds. */
+  timestamp: number;
+  danger: DangerLevel;
+}
+
+/** Resolve a pending approval request. */
+export function respondToApproval(id: string, decision: ApprovalDecision): Promise<void> {
+  return invoke('respond_to_approval', { id, decision });
+}
+
 /** Live MCP tool-call notification. Mirrors Rust `McpCallEvent`. */
 export interface McpCallEvent {
   id: string;

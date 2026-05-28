@@ -20,6 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use aidock_lib::agent::approval::{new_pending_approvals, ApprovalRegistry};
 use aidock_lib::agent::Session;
 use aidock_lib::keyring_store;
 use tokio::time::sleep;
@@ -65,7 +66,14 @@ async fn main() -> anyhow::Result<()> {
     println!("└─");
     println!();
 
-    let session = Session::start(session_dir.clone(), api_key, None).await?;
+    let session = Session::start(
+        session_dir.clone(),
+        api_key,
+        None,
+        ApprovalRegistry::new(),
+        new_pending_approvals(),
+    )
+    .await?;
     session.submit_user_input(SCENARIO.to_string(), None).await?;
     println!("(user prompt submitted — waiting for files to appear)\n");
 

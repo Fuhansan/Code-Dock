@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
+use crate::agent::approval::{new_pending_approvals, ApprovalRegistry, Decision, PendingApprovals};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
 use crate::agent::{Session, SessionError};
@@ -51,9 +52,24 @@ impl serde::Serialize for CommandError {
 
 /// Process-wide state owned by Tauri's `.manage()`. V0.1 holds at most one
 /// running `Session`. Future versions extend this to a map keyed by session id.
-#[derive(Default)]
 pub struct AppState {
     pub session: Mutex<Option<Session>>,
+    /// Sprint 4.6: per-session approval registry for destructive MCP
+    /// tools. Lives in AppState so the `respond_to_approval` command can
+    /// reach it without going through the session lock.
+    pub approval: ApprovalRegistry,
+    /// In-flight approval requests awaiting user decision.
+    pub pending_approvals: PendingApprovals,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            session: Mutex::new(None),
+            approval: ApprovalRegistry::new(),
+            pending_approvals: new_pending_approvals(),
+        }
+    }
 }
 
 // ---------- Sprint 0 health check ----------
@@ -138,7 +154,14 @@ pub async fn start_session(
     }
     let key = keyring_store::load_api_key("bailian")?
         .ok_or_else(|| CommandError::ProviderNotConfigured("bailian".to_string()))?;
-    let session = Session::start(default_session_dir(), key, Some(app)).await?;
+    let session = Session::start(
+        default_session_dir(),
+        key,
+        Some(app),
+        state.approval.clone(),
+        state.pending_approvals.clone(),
+    )
+    .await?;
     *guard = Some(session);
     tracing::info!(target: "aidock::cmd", "session started");
     Ok(())
@@ -162,6 +185,36 @@ pub async fn send_user_message(
     let session = guard.as_ref().ok_or(CommandError::NoActiveSession)?;
     session.submit_user_input(content, topic_id).await?;
     Ok(())
+}
+
+/// Sprint 4.6: frontend calls this when the user clicks a button on an
+/// approval prompt. Looks up the pending sender by id and fulfils the
+/// oneshot channel waiting in the runtime.
+#[tauri::command]
+pub async fn respond_to_approval(
+    id: String,
+    decision: Decision,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let mut pending = state.pending_approvals.lock().await;
+    match pending.remove(&id) {
+        Some(tx) => {
+            // Result is OK iff receiver still listening — timeout could
+            // have dropped it. Either way nothing else for us to do.
+            let _ = tx.send(decision);
+            Ok(())
+        }
+        None => {
+            // Either the runtime never registered (bug) or the request
+            // already timed out. Tell the user, but not as a hard error.
+            tracing::info!(
+                target: "aidock::cmd",
+                approval_id = %id,
+                "respond_to_approval: no pending request — already resolved or timed out"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Read the persisted message history for the default session. Sprint 3:

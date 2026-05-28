@@ -4,13 +4,17 @@
   import {
     MESSAGE_EVENT,
     MCP_CALL_EVENT,
+    APPROVAL_REQUEST_EVENT,
     startSession,
     sendUserMessage,
     sessionStatus,
     loadMessageHistory,
+    respondToApproval,
     type AgentMessage,
     type AgentMessageKind,
-    type McpCallEvent
+    type McpCallEvent,
+    type ApprovalRequest,
+    type ApprovalDecision
   } from '$lib/ipc';
 
   type TimelineItem =
@@ -70,6 +74,33 @@
   let scrollRef = $state<HTMLDivElement | null>(null);
   let unlistenMsg: UnlistenFn | null = null;
   let unlistenMcp: UnlistenFn | null = null;
+  let unlistenApproval: UnlistenFn | null = null;
+
+  // Sprint 4.6: queue of pending approval prompts. Show one at a time as
+  // a banner; queue the rest so multiple agents racing for approval
+  // don't pile up overlapping modals.
+  let approvalQueue = $state<ApprovalRequest[]>([]);
+  let approvalInFlight = $state<string | null>(null);
+  const currentApproval = $derived(approvalQueue[0] ?? null);
+
+  async function decide(decision: ApprovalDecision) {
+    if (!currentApproval || approvalInFlight) return;
+    approvalInFlight = currentApproval.id;
+    try {
+      await respondToApproval(currentApproval.id, decision);
+    } catch (e) {
+      console.warn('respond_to_approval failed:', e);
+    } finally {
+      // Drop the head whether the command succeeded or not — the runtime
+      // either got our decision or has already timed out.
+      approvalQueue = approvalQueue.slice(1);
+      approvalInFlight = null;
+    }
+  }
+
+  function dangerLabel(d: ApprovalRequest['danger']): string {
+    return d === 'destructive' ? '高风险' : d === 'mutating' ? '修改文件' : '只读';
+  }
 
   function insertItem(item: TimelineItem) {
     // Append-and-sort. Sort is stable + cheap for the message volumes V0.1
@@ -136,6 +167,13 @@
         insertItem({ kind: 'mcp', ts: e.timestamp, data: e });
         await scrollToBottom();
       });
+      // Sprint 4.6: approval prompts.
+      unlistenApproval = await listen<ApprovalRequest>(
+        APPROVAL_REQUEST_EVENT,
+        (event) => {
+          approvalQueue = [...approvalQueue, event.payload];
+        }
+      );
     } catch (e) {
       bootError = e instanceof Error ? e.message : String(e);
       return;
@@ -154,6 +192,7 @@
   onDestroy(() => {
     if (unlistenMsg) unlistenMsg();
     if (unlistenMcp) unlistenMcp();
+    if (unlistenApproval) unlistenApproval();
   });
 
   async function handleSend() {
@@ -226,6 +265,39 @@
     </div>
   {:else if !ready}
     <div class="banner muted">正在启动工作室会话…</div>
+  {/if}
+
+  {#if currentApproval}
+    {@const s = styleFor(currentApproval.agent)}
+    <div class="approval-banner" style:--accent={s.color}>
+      <div class="approval-head">
+        <span class="approval-label">⚠ 需要批准</span>
+        <span class="approval-agent" style:color={s.color}>{s.label}</span>
+        <span class="approval-danger">{dangerLabel(currentApproval.danger)}</span>
+        {#if approvalQueue.length > 1}
+          <span class="approval-queue">+{approvalQueue.length - 1} 个排队</span>
+        {/if}
+      </div>
+      <div class="approval-tool">🔧 {currentApproval.tool}</div>
+      <div class="approval-args">{currentApproval.args_preview}</div>
+      <div class="approval-actions">
+        <button
+          class="appr-btn deny"
+          onclick={() => decide('reject')}
+          disabled={!!approvalInFlight}
+        >拒绝</button>
+        <button
+          class="appr-btn once"
+          onclick={() => decide('allow_once')}
+          disabled={!!approvalInFlight}
+        >仅本次允许</button>
+        <button
+          class="appr-btn session"
+          onclick={() => decide('allow_session')}
+          disabled={!!approvalInFlight}
+        >本会话允许</button>
+      </div>
+    </div>
   {/if}
 
   <div class="chat-area" bind:this={scrollRef}>
@@ -497,6 +569,106 @@
     color: #1c1c1e;
   }
 
+  /* Sprint 4.6 — approval banner */
+  .approval-banner {
+    background: #fff8e6;
+    border: 1px solid #ffcc66;
+    border-left: 4px solid var(--accent, #ff9500);
+    padding: 12px 16px;
+    margin: 8px 16px 0;
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .approval-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .approval-label {
+    font-weight: 600;
+    color: #b35a00;
+  }
+  .approval-agent {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .approval-danger {
+    background: #ff9500;
+    color: #ffffff;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+  .approval-queue {
+    margin-left: auto;
+    font-size: 11px;
+    color: #8e8e93;
+  }
+  .approval-tool {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 13px;
+    color: #1c1c1e;
+  }
+  .approval-args {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    color: #6e6e73;
+    background: rgba(255, 255, 255, 0.6);
+    padding: 8px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+  .approval-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+  .appr-btn {
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 500;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .appr-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .appr-btn.deny {
+    background: #ff3b30;
+    color: #ffffff;
+  }
+  .appr-btn.deny:hover:not(:disabled) {
+    background: #d62b22;
+  }
+  .appr-btn.once {
+    background: #ffffff;
+    border-color: #d2d2d7;
+    color: #1c1c1e;
+  }
+  .appr-btn.once:hover:not(:disabled) {
+    background: #f5f5f7;
+  }
+  .appr-btn.session {
+    background: #34c759;
+    color: #ffffff;
+  }
+  .appr-btn.session:hover:not(:disabled) {
+    background: #2aa849;
+  }
+
   /* Sprint 4.5 — MCP tool-call cards (one card per agent's consecutive
      activity, sub-lines for each call) */
   .mcp-card {
@@ -708,6 +880,25 @@
     }
     .topic-title {
       color: #f5f5f7;
+    }
+    .approval-banner {
+      background: #2c2410;
+      border-color: #6e5318;
+    }
+    .approval-tool {
+      color: #f5f5f7;
+    }
+    .approval-args {
+      background: rgba(0, 0, 0, 0.3);
+      color: #d1d1d6;
+    }
+    .appr-btn.once {
+      background: #38383a;
+      border-color: #48484a;
+      color: #f5f5f7;
+    }
+    .appr-btn.once:hover:not(:disabled) {
+      background: #48484a;
     }
   }
 </style>
