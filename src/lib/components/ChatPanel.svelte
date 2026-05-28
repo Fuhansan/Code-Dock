@@ -17,12 +17,37 @@
     | { kind: 'message'; ts: number; data: AgentMessage }
     | { kind: 'mcp'; ts: number; data: McpCallEvent };
 
+  type RenderItem =
+    | { kind: 'message'; data: AgentMessage }
+    | { kind: 'mcp_group'; agent: string; calls: McpCallEvent[] };
+
   // ---- Sprint 2: multi-agent group chat ----
 
   // Sprint 4.5: unified timeline. AgentMessages and McpCallEvents both
   // land here, sorted by their backend timestamp so the user sees the
   // chat in causal order even when MCP events arrive between messages.
   let timeline = $state<TimelineItem[]>([]);
+
+  // Sprint 4.5 refinement: collapse consecutive MCP events from the same
+  // agent into one group, rendered as a single "work card" with sub-lines.
+  // Stops the chat from being drowned by 4–8 cards per agent activity.
+  // Re-runs whenever timeline changes — cheap for V0.1 message volumes.
+  const renderItems = $derived.by<RenderItem[]>(() => {
+    const out: RenderItem[] = [];
+    for (const it of timeline) {
+      if (it.kind === 'message') {
+        out.push({ kind: 'message', data: it.data });
+        continue;
+      }
+      const last = out[out.length - 1];
+      if (last && last.kind === 'mcp_group' && last.agent === it.data.agent) {
+        last.calls.push(it.data);
+      } else {
+        out.push({ kind: 'mcp_group', agent: it.data.agent, calls: [it.data] });
+      }
+    }
+    return out;
+  });
   // Derived "messages only" view for backward-compat checks (empty test,
   // input enabled, etc.).
   let messages = $derived(timeline.filter((i) => i.kind === 'message') as Array<{
@@ -211,18 +236,30 @@
       </div>
     {/if}
 
-    {#each timeline as item (item.kind === 'message' ? item.data.id : item.data.id)}
-      {#if item.kind === 'mcp'}
-        {@const e = item.data}
-        {@const s = styleFor(e.agent)}
-        <div class="mcp-card" class:err={!e.success} style:--accent={s.color}>
+    {#each renderItems as item, idx (idx)}
+      {#if item.kind === 'mcp_group'}
+        {@const s = styleFor(item.agent)}
+        {@const okCount = item.calls.filter((c) => c.success).length}
+        {@const errCount = item.calls.length - okCount}
+        <div class="mcp-card" style:--accent={s.color}>
           <div class="mcp-head">
-            <span class="mcp-tool">🔧 {e.tool}</span>
             <span class="mcp-agent" style:color={s.color}>{s.label}</span>
-            {#if !e.success}<span class="mcp-badge">ERR</span>{/if}
+            <span class="mcp-summary">
+              🔧 {item.calls.length} 次工具调用{#if errCount > 0} · <span class="mcp-err-count">{errCount} 失败</span>{/if}
+            </span>
           </div>
-          <div class="mcp-args">{e.args_preview}</div>
-          <div class="mcp-result">{e.result_preview}</div>
+          <ul class="mcp-list">
+            {#each item.calls as c (c.id)}
+              <li class="mcp-row" class:err={!c.success}>
+                <div class="mcp-row-head">
+                  <span class="mcp-tool">{c.tool}</span>
+                  {#if !c.success}<span class="mcp-badge">ERR</span>{/if}
+                </div>
+                <div class="mcp-args">{c.args_preview}</div>
+                <div class="mcp-result">{c.result_preview}</div>
+              </li>
+            {/each}
+          </ul>
         </div>
       {:else}
         {@const msg = item.data}
@@ -460,7 +497,8 @@
     color: #1c1c1e;
   }
 
-  /* Sprint 4.5 — MCP tool-call cards */
+  /* Sprint 4.5 — MCP tool-call cards (one card per agent's consecutive
+     activity, sub-lines for each call) */
   .mcp-card {
     align-self: stretch;
     border-left: 3px solid var(--accent, #c7c7cc);
@@ -468,31 +506,62 @@
     border-radius: 0 8px 8px 0;
     padding: 8px 12px;
     font-size: 12px;
-    line-height: 1.4;
+    line-height: 1.45;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
     margin-left: 4px;
-  }
-  .mcp-card.err {
-    background: #fff7f6;
-    border-left-color: #ff3b30;
   }
   .mcp-head {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .mcp-tool {
-    font-family: 'SF Mono', Menlo, monospace;
-    font-size: 12px;
-    font-weight: 500;
-  }
   .mcp-agent {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.04em;
+  }
+  .mcp-summary {
+    font-size: 12px;
+    color: #6e6e73;
+  }
+  .mcp-err-count {
+    color: #ff3b30;
+    font-weight: 500;
+  }
+  .mcp-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .mcp-row {
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: #ffffff;
+    border-left: 2px solid #d2d2d7;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .mcp-row.err {
+    background: #fff7f6;
+    border-left-color: #ff3b30;
+  }
+  .mcp-row-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .mcp-tool {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    font-weight: 500;
+    color: #1c1c1e;
   }
   .mcp-badge {
     font-size: 10px;
@@ -615,16 +684,27 @@
       color: #98989d;
     }
     .mcp-card {
-      background: #1c1c1e;
+      background: #2c2c2e;
     }
-    .mcp-card.err {
+    .mcp-row {
+      background: #1c1c1e;
+      border-left-color: #38383a;
+    }
+    .mcp-row.err {
       background: #3a1f1d;
+      border-left-color: #ff3b30;
+    }
+    .mcp-tool {
+      color: #f5f5f7;
     }
     .mcp-args {
       color: #8e8e93;
     }
     .mcp-result {
       color: #d1d1d6;
+    }
+    .mcp-summary {
+      color: #98989d;
     }
     .topic-title {
       color: #f5f5f7;
