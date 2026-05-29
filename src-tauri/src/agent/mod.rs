@@ -14,11 +14,14 @@
 pub mod approval;
 pub mod context;
 pub mod dispatcher;
+pub mod llm_source;
 pub mod mcp;
+pub mod mcp_executor;
 pub mod mcp_log;
 pub mod message;
 pub mod persistence;
 pub mod protocol;
+pub mod react;
 pub mod recall;
 pub mod role;
 pub mod roles;
@@ -27,6 +30,7 @@ pub mod scratchpad;
 pub mod session;
 pub mod state;
 pub mod topic;
+pub mod turn_bridge;
 
 pub use dispatcher::{Dispatcher, DispatcherError, DispatcherHandle, MESSAGE_EVENT};
 pub use message::{AgentId, AgentMessage, AgentMessageKind, MessageId, TopicId};
