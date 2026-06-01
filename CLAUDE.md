@@ -41,7 +41,7 @@ V0.1 把整个 ④ 当成一个"reflex"实现：一条入消息 → 一次 LLM c
 - **接口**:
   - 入：incoming `AgentMessage` + ④.b 给的 context bundle
   - 出：next action（发消息 / 调工具 / 等待 / 结束回合），可循环
-- **现状**: 没有。当前 runtime 等价于 plan=∅, act=单次 LLM call 的退化形式
+- **现状**: ✅ 已落地（#1+#2）。`react.rs`(纯循环) + `llm_source.rs`(ActionSource/⑤) + `mcp_executor.rs`(ActionExecutor/④.d 钩子 + CompositeExecutor 路由 mcp/query/scratchpad) + `turn_bridge.rs`(③ 边界翻译)。`runtime.rs::run_agent` 已从退化 loop 改成 ReAct 回合宿主（classify_incoming + 挂起/恢复 + 待办队列）。**待验**：端到端（真 LLM+MCP）尚需 dev server 跑一遍；进度事件(②)仍用 NullSink，留给 #3
 
 ##### 数据模型（一回合里存的东西）
 
@@ -234,6 +234,36 @@ loop {
   - 出：routing through dry-run / temp 目录；最终 commit 或 rollback
 - **现状**: 没有。approval gate 只是问用户"能不能干"，干就直接动真盘
 - **与 approval 的区别**: approval gate 是"问人"，沙箱是"agent 自己先验"。两条独立通道
+
+> **shell / 命令执行能力 = ④.d 的硬前置，不得提前放出。** dev-test 时用户提出"让 agent 跑 `npm run dev` 启动项目"。结论：**推迟到 ④.d**。理由：shell 是地基阶段最危险的不可逆能力，只靠 approval gate（问人）远远不够。而且它需要的沙箱**比本节原设想的"temp 副本 / dry-run"更强**——那针对文件操作；任意进程要的是 **OS 级隔离**（容器 / `sandbox-exec` / chroot+seccomp / 资源限制 / 断网），挡住 `rm -rf /`、外联、挖矿。设计要点：① 工具 `shell__run(command, background?)`，一次性等结果 / 长驻后台 spawn+登记 PID ② 路由进 `CompositeExecutor`（新 `ShellExecutor` 分支，原生 `tokio::process`，不走 MCP）③ `classify()` 标 Destructive，过审批门 ④ 仅工程师角色，PM 无 ⑤ 跑在 OS 沙箱内。在 ④.d OS 沙箱就绪前，agent 只写文件 + 把启动命令告诉用户，由用户手动跑。
+
+##### 设计基线（对标 Claude Code 的沙箱，2026-06 查证）
+
+CC 的沙箱不是容器/VM，是 **OS 原语**：**macOS = Seatbelt（`sandbox-exec`/SBPL）**，**Linux/WSL2 = bubblewrap + namespaces + seccomp**。Anthropic 把它开源成 npm 包 **`@anthropic-ai/sandbox-runtime`**（包住一个进程 + 网络代理 + 可选 seccomp）。对 AiDock 这种本地桌面工具，OS 原语优于容器（不依赖 Docker、启动快、无小白门槛）；容器/远程沙箱留作"更强更重"的产品级选项。
+
+落到我们架构的 5 条基线：
+1. **机制**：OS 原语（mac Seatbelt / Linux bwrap+seccomp）。优先评估直接 *adopt* `@anthropic-ai/sandbox-runtime` 而非从零造（AiDock 已在用 npx 跑 Node 子进程，接得上）。
+2. **挂载点**：④.a 的 `ActionExecutor::execute()` **唯一执行口子**——"开沙箱"=工具在盒子里跑，`CompositeExecutor` 路由一行不改，只换执行后端。
+3. **文件**：写限 workspace；读默认宽——但**必须默认 `denyRead` `~/.ssh`、`~/.aws/credentials` 等敏感路径**（CC 默认不挡，这是它的坑，别抄）。
+4. **网络**：deny-by-default + 主机名白名单代理（代理在盒**外**，不解 TLS → 宽白名单有 domain-fronting 风险）。dev 刚需域（npm/pypi/cargo registry 等）进默认白名单，否则 `npm install` 直接挂。
+5. **沙箱 × 审批关系（修正旧"两条独立通道"说法）**：**沙箱是强制底线，审批只在"越界"（写出界 / 连新域名）时才触发**。界内操作直接跑、不烦用户——顺带治掉"每个写文件都要点批准"的痛（dev-test 实测的痛点）。
+
+##### 施工方案（混合，分阶段）—— 已定，实现排在 ④.b/④.c 之后
+
+**ASRT 评估结论（spike 2026-06）**：`@anthropic-ai/sandbox-runtime`（`srt` CLI，Apache-2.0，v0.0.52，实验性 0.0.x）—— ✅ 有限命令完美（自带 Seatbelt + 网络白名单代理，JSON 配 `denyRead/allowWrite/allowedDomains`）；❌ **长驻 dev server 不支持**（`allowLocalBinding` 默认关、端口宿主可达性无文档、代理生命周期绑被包进程、无 daemon）。Node 依赖对 AiDock 是 free（已靠 npx 跑 MCP）。
+
+**所以劈成两半（都走 `ShellExecutor` → ④.a `execute()` 口子，`classify()` 标 Destructive 过审批，仅工程师角色）**：
+
+| 用途 | 选型 | 理由 |
+|---|---|---|
+| 有限命令（install/build/test/lint） | **adopt ASRT**（`srt --settings x.json <cmd>`） | 出站网络白名单是难点，ASRT 白送 |
+| 长驻 dev server（npm run dev） | **自建 Seatbelt 包装**（Rust shell→`sandbox-exec` + 自定义 profile） | ASRT 搞不定；自定义 profile 允许绑端口 + detached spawn + 进程登记表（列/杀），宿主浏览器直访 localhost:port |
+
+**分阶段**：
+- **P0 spike**：✅ ASRT 调研完；剩 PoC——验证自建 Seatbelt profile 能否让宿主访问 dev server 端口（~半天）。
+- **P1 有限命令沙箱（MVP）**：`shell__run(command)`→ASRT；workspace 写限制 + `denyRead ~/.ssh ~/.aws` + dev registry 白名单；接 CompositeExecutor + 审批 + 工程师专属；`Sandbox` trait 做成可 fake 接缝，测试驱动。
+- **P2 长驻服务**：`shell__serve`/background → 自建 Seatbelt + 进程登记表 + 端口暴露（解"看界面"）。
+- **P3 加固/跨平台**：Linux bwrap、沙箱=底线/审批=越界才触发的 UX、资源限制。
 
 ### ④ 子模块依赖与推进顺序
 1. **④.a 是地基**——其他三个都假设有 plan / act 区分
