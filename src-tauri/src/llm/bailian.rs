@@ -17,6 +17,11 @@ const DEFAULT_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const PROVIDER_ID: &str = "bailian";
 
 /// Bailian / Qwen provider.
+///
+/// `Clone` is cheap — `reqwest::Client` is internally `Arc`, so cloning shares
+/// the connection pool. The ④.a turn host (runtime) builds one provider per
+/// agent and clones it into each turn's `LlmSource`.
+#[derive(Clone)]
 pub struct BailianProvider {
     api_key: String,
     base_url: String,
@@ -180,7 +185,10 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "qwen3.6-plus");
-        assert_eq!(json["temperature"], 0.3);
+        // temperature is f32; widening to f64 in JSON makes 0.3 print as
+        // 0.30000001…, so compare back at f32 precision rather than to a
+        // literal 0.3_f64.
+        assert_eq!(json["temperature"].as_f64().unwrap() as f32, 0.3_f32);
         assert_eq!(json["max_tokens"], 64);
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"], "hi");

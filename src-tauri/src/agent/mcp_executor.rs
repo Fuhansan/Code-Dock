@@ -18,10 +18,14 @@
 //! scratchpad tools are ④.b (memory) concerns and get routed when ④.b is
 //! wired; for now they return a clear error rather than silently passing.
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::mcp::{make_call_event, McpCallEvent, McpClient, MCP_TOOL_PREFIX};
+use crate::agent::message::AgentMessage;
 use crate::agent::react::{ActionExecutor, ExecResult};
+use crate::agent::recall::{execute_query_tool, is_query_tool};
+use crate::agent::scratchpad::{apply_update, is_scratchpad_tool, Scratchpad};
 
 /// Outcome of the approval gate for one tool call. Mirrors the private enum in
 /// `runtime.rs`; lifted here so the executor owns its own seam type.
@@ -80,14 +84,21 @@ impl CallSink for NullCallSink {
     async fn record(&self, _event: McpCallEvent) {}
 }
 
-/// Real network backend: forwards to a live [`McpClient`].
+/// Real network backend: forwards to a live [`McpClient`]. `None` when the
+/// filesystem server didn't start this session — fs calls then fail cleanly
+/// instead of panicking.
 pub struct McpClientBackend {
-    pub client: McpClient,
+    pub client: Option<McpClient>,
 }
 
 impl ToolBackend for McpClientBackend {
     async fn call(&self, tool: &str, args: &str) -> Result<String, String> {
-        self.client.call_tool(tool, args).await.map_err(|e| e.to_string())
+        match &self.client {
+            Some(c) => c.call_tool(tool, args).await.map_err(|e| e.to_string()),
+            None => Err(format!(
+                "MCP server not available this session — '{tool}' can't run"
+            )),
+        }
     }
 }
 
@@ -168,6 +179,96 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// CompositeExecutor — routes a ToolCall to the right handler so the live
+// runtime keeps recall / scratchpad working alongside MCP (CLAUDE.md #2b).
+//
+// Routing:
+//   - fs__*                          → McpExecutor (the ④.d chokepoint)
+//   - recall_topic / search_topic    → execute_query_tool (read-only, on a
+//                                       turn-start history snapshot)
+//   - update_scratchpad              → apply_update + persist
+//
+// Scope note: query / scratchpad are really ④.b (memory) concerns living here
+// transitionally. When ④.b lands they migrate out and this shrinks back to a
+// thin MCP wrapper. The history snapshot is read-only and taken at turn start —
+// fine because recall targets *closed* topics, which don't change mid-turn.
+// ---------------------------------------------------------------------------
+
+pub struct CompositeExecutor<B, A, S> {
+    mcp: McpExecutor<B, A, S>,
+    history: Vec<AgentMessage>,
+    scratchpad: Scratchpad,
+    scratchpad_path: PathBuf,
+}
+
+impl<B, A, S> CompositeExecutor<B, A, S> {
+    pub fn new(
+        mcp: McpExecutor<B, A, S>,
+        history: Vec<AgentMessage>,
+        scratchpad: Scratchpad,
+        scratchpad_path: PathBuf,
+    ) -> Self {
+        Self {
+            mcp,
+            history,
+            scratchpad,
+            scratchpad_path,
+        }
+    }
+
+    /// Reclaim the (possibly mutated) scratchpad when the turn ends, so the
+    /// runtime can carry it into the next turn.
+    pub fn into_scratchpad(self) -> Scratchpad {
+        self.scratchpad
+    }
+}
+
+impl<B, A, S> ActionExecutor for CompositeExecutor<B, A, S>
+where
+    B: ToolBackend + Send + Sync,
+    A: Approver + Send + Sync,
+    S: CallSink + Send + Sync,
+{
+    async fn execute(&mut self, tool: &str, args: &str) -> ExecResult {
+        if is_query_tool(tool) {
+            match execute_query_tool(tool, args, &self.history) {
+                Ok(raw) => ExecResult { raw, success: true },
+                Err(e) => ExecResult {
+                    raw: format!("ERROR: query '{tool}' failed: {e}"),
+                    success: false,
+                },
+            }
+        } else if is_scratchpad_tool(tool) {
+            match apply_update(&mut self.scratchpad, args) {
+                Ok(confirmation) => {
+                    // In-memory update is the source of truth; a save failure
+                    // is logged but doesn't fail the tool (mirrors old runtime).
+                    if let Err(e) = self.scratchpad.save(&self.scratchpad_path) {
+                        tracing::error!(
+                            target: "aidock::agent",
+                            path = %self.scratchpad_path.display(),
+                            error = %e,
+                            "scratchpad updated in memory but save FAILED"
+                        );
+                    }
+                    ExecResult {
+                        raw: confirmation,
+                        success: true,
+                    }
+                }
+                Err(e) => ExecResult {
+                    raw: format!("ERROR: scratchpad update failed: {e}"),
+                    success: false,
+                },
+            }
+        } else {
+            // fs__* (and anything else, which the McpExecutor rejects cleanly).
+            self.mcp.execute(tool, args).await
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,5 +387,52 @@ mod tests {
         assert!(res.raw.contains("not an MCP tool"));
         assert!(!ex.backend.called.load(Ordering::SeqCst));
         assert!(ex.sink.events.lock().unwrap().is_empty(), "no event for a non-call");
+    }
+
+    // --- CompositeExecutor routing ----------------------------------------
+
+    use std::sync::atomic::AtomicU32;
+    static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_scratchpad_path() -> PathBuf {
+        let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("aidock-test-sp-{}-{n}.json", std::process::id()))
+    }
+
+    fn composite() -> CompositeExecutor<FakeBackend, AllowAll, RecordingSink> {
+        let mcp = McpExecutor::new(
+            "frontend_dev",
+            FakeBackend::ok("[FILE] index.html"),
+            AllowAll,
+            RecordingSink::default(),
+        );
+        CompositeExecutor::new(mcp, Vec::new(), Scratchpad::default(), temp_scratchpad_path())
+    }
+
+    #[tokio::test]
+    async fn composite_routes_fs_to_mcp() {
+        let mut ex = composite();
+        let res = ex.execute("fs__list_directory", r#"{"path":"."}"#).await;
+        assert!(res.success);
+        assert_eq!(res.raw, "[FILE] index.html");
+    }
+
+    #[tokio::test]
+    async fn composite_routes_query_tool() {
+        let mut ex = composite();
+        // Empty history: recall returns a (non-error) "nothing found"-style body.
+        let res = ex.execute("recall_topic", r#"{"topic_id":"t-1"}"#).await;
+        assert!(res.success, "query should succeed even on empty history: {}", res.raw);
+    }
+
+    #[tokio::test]
+    async fn composite_routes_scratchpad_and_mutates() {
+        let mut ex = composite();
+        let res = ex
+            .execute("update_scratchpad", r#"{"current_focus":"build login"}"#)
+            .await;
+        assert!(res.success);
+        let pad = ex.into_scratchpad();
+        assert_eq!(pad.current_focus, "build login");
     }
 }

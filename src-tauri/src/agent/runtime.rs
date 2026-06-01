@@ -30,7 +30,6 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -44,66 +43,34 @@ use crate::agent::approval::{
     classify, ApprovalRegistry, ApprovalRequest, Danger, Decision, LookupResult, PendingApprovals,
     APPROVAL_REQUEST_EVENT, APPROVAL_TIMEOUT_SECS,
 };
-use crate::agent::role::McpAccess;
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
-use crate::agent::mcp::{
-    make_call_event, truncate, McpClient, MCP_CALL_EVENT, MCP_PREVIEW_MAX, MCP_TOOL_PREFIX,
-};
+use crate::agent::mcp::{truncate, McpClient, MCP_CALL_EVENT, MCP_PREVIEW_MAX};
 use crate::agent::mcp_log::McpLogHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
-use crate::agent::protocol::{message_tools, parse_tool_call, ParsedToolCall};
-use crate::agent::recall::{execute_query_tool, is_query_tool, query_tools};
+use crate::agent::protocol::message_tools;
+use crate::agent::recall::query_tools;
 use crate::agent::role::{McpAccess as RoleMcpAccess, RoleConfig};
 use crate::agent::roles::PM_ID;
-use crate::agent::scratchpad::{
-    apply_update as apply_scratchpad_update, is_scratchpad_tool, scratchpad_tools, Scratchpad,
-};
+use crate::agent::scratchpad::{scratchpad_tools, Scratchpad};
 use crate::agent::state::AgentState;
 use crate::llm::bailian::BailianProvider;
-use crate::llm::{ChatMessage, ChatRequest, LLMProvider, Tool};
+use crate::llm::Tool;
 
-/// Cap on how many auxiliary→action loops one agent turn may run. Above
-/// this we emit a warning and stop — protects against a model that keeps
-/// recalling / scratchpad-updating / MCP-tool-calling without ever
-/// committing to an action.
-///
-/// Bumped from 3 in Sprint 4 after the e2e demo showed a developer
-/// realistically uses 4+ MCP calls per turn (list_directory → write_file
-/// → list_directory → write_file → DONE). Three was too tight for any
-/// non-trivial coding flow.
-const MAX_QUERY_LOOP_ITERATIONS: usize = 6;
+use std::collections::VecDeque;
 
-/// True iff `name` is a Sprint 4 MCP-routed tool (prefix-tagged at
-/// projection time in `agent::mcp`).
-fn is_mcp_tool(name: &str) -> bool {
-    name.starts_with(MCP_TOOL_PREFIX)
-}
+use crate::agent::llm_source::{set_plan_tool, LlmSource};
+use crate::agent::mcp::McpCallEvent;
+use crate::agent::mcp_executor::{
+    ApprovalOutcome, Approver, CallSink, CompositeExecutor, McpClientBackend, McpExecutor,
+};
+use crate::agent::react::{AlwaysContinue, NullSink, PlanLoop, TurnOutcome, TurnState};
+use crate::agent::turn_bridge::{ask_to_kind, outbound_to_kind};
 
-/// True iff this tool call DOES NOT end the agent's turn. Query, scratchpad
-/// and MCP tools all loop back to the LLM so the agent can act with the
-/// fetched data / breadcrumb / fs result in mind.
-fn is_auxiliary_tool(name: &str) -> bool {
-    is_query_tool(name) || is_scratchpad_tool(name) || is_mcp_tool(name)
-}
-
-/// True iff this AgentMessageKind concludes the agent's turn. Sprint 4
-/// refinement: WORK_START and PROGRESS are "soft actions" — they dispatch
-/// a message to the team but the emitter keeps thinking (typically to
-/// follow up with fs__write_file calls and a final DONE). Without this
-/// rule a developer agent emitting WORK_START would block forever waiting
-/// for someone to ASK_AGENT them back.
-fn is_terminal_message_kind(kind: &AgentMessageKind) -> bool {
-    matches!(
-        kind,
-        AgentMessageKind::Broadcast { .. }
-            | AgentMessageKind::AskAgent { .. }
-            | AgentMessageKind::Answer { .. }
-            | AgentMessageKind::Done { .. }
-            | AgentMessageKind::Summary { .. }
-    )
-    // NOT terminal: WorkStart, Progress, UserInput (UserInput never emitted by agents).
-}
+// (Sprint-4 auxiliary-loop helpers removed in the #2b cutover: the ReAct
+// turn host no longer hand-rolls a per-tool loop or a terminal-kind check —
+// the PlanLoop owns turn termination and the CompositeExecutor owns tool
+// routing.)
 
 /// All tools advertised on every LLM call: action message tools + query
 /// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8) + the slice of MCP
@@ -184,6 +151,78 @@ pub fn spawn_agent(boot: AgentBoot) -> JoinHandle<()> {
     tokio::spawn(run_agent(boot))
 }
 
+/// The concrete ④.a loop the live runtime drives. Spelled out once so the
+/// suspended-turn stash can name its type.
+type LiveLoop = PlanLoop<
+    LlmSource<BailianProvider>,
+    CompositeExecutor<McpClientBackend, RealApprover, RealCallSink>,
+    AlwaysContinue,
+    NullSink,
+>;
+
+/// A turn parked mid-flight waiting for an answer (CLAUDE.md ④.a 硬约束 + #2b).
+/// Holds the *live* loop — its `LlmSource` conversation, executor, and the
+/// scratchpad moved inside — so resume continues exactly where it left off,
+/// not a fresh think. Kept in memory for V0.1.
+/// > TODO: persist across app restart (落 ⑥) — see CLAUDE.md ③ 接线.
+struct SuspendedTurn {
+    plan_loop: LiveLoop,
+    state: TurnState,
+    /// The ASK message id we're parked on; an incoming ANSWER matches it.
+    ask_id: String,
+    /// Topic to stamp on messages when the turn resumes.
+    topic: TopicId,
+}
+
+/// Real approval seam: delegates to [`gate_mcp_call`]. Headless (no UI) proceeds
+/// without prompting, mirroring the pre-cutover behavior.
+struct RealApprover {
+    registry: ApprovalRegistry,
+    pending: PendingApprovals,
+    app_handle: Option<tauri::AppHandle>,
+}
+
+impl Approver for RealApprover {
+    async fn decide(&self, agent: &str, tool: &str, args: &str) -> ApprovalOutcome {
+        if self.app_handle.is_none() {
+            return ApprovalOutcome::Proceed;
+        }
+        gate_mcp_call(
+            agent,
+            tool,
+            args,
+            &self.registry,
+            &self.pending,
+            self.app_handle.as_ref(),
+        )
+        .await
+    }
+}
+
+/// Real fan-out seam: the full-fidelity MCP call event → UI (Tauri) + ⑥
+/// (`mcp_calls.jsonl`). The ⑥/① pipe of the two-pipe rule.
+struct RealCallSink {
+    app_handle: Option<tauri::AppHandle>,
+    mcp_log: Option<McpLogHandle>,
+}
+
+impl CallSink for RealCallSink {
+    async fn record(&self, event: McpCallEvent) {
+        if let Some(handle) = &self.app_handle {
+            if let Err(e) = handle.emit(MCP_CALL_EVENT, &event) {
+                tracing::warn!(
+                    target: "aidock::agent",
+                    error = %e,
+                    "failed to emit MCP call event"
+                );
+            }
+        }
+        if let Some(log) = &self.mcp_log {
+            log.record(event).await;
+        }
+    }
+}
+
 async fn run_agent(boot: AgentBoot) {
     let AgentBoot {
         role,
@@ -201,10 +240,9 @@ async fn run_agent(boot: AgentBoot) {
         mcp_log,
     } = boot;
 
-    // Pre-compute the full tool list once per agent (MCP tools are static
-    // across the session — server's tool catalog doesn't change, role's
-    // mcp_access doesn't change either).
-    let tools = build_all_tools(mcp.as_ref(), role.mcp_access);
+    // Tools: set_plan (④.a) prepended to the role's message/aux/MCP tools.
+    let mut tools = vec![set_plan_tool()];
+    tools.extend(build_all_tools(mcp.as_ref(), role.mcp_access));
 
     tracing::info!(
         target: "aidock::agent",
@@ -213,289 +251,217 @@ async fn run_agent(boot: AgentBoot) {
         state = initial_state.tag(),
         mcp_access = ?role.mcp_access,
         advertised_tools = tools.len(),
-        "agent task started"
+        "agent task started (ReAct turn host)"
     );
 
+    // One provider per agent; cloned (cheap — shared pool) into each turn.
     let provider = BailianProvider::new(api_key);
     let mut state = initial_state;
     let mut history: Vec<AgentMessage> = initial_history;
-    let mut scratchpad = initial_scratchpad;
+    // `Some` while idle/between turns; `None` while a turn owns it (active or
+    // parked). One-turn-at-a-time guarantees no concurrent access.
+    let mut scratchpad: Option<Scratchpad> = Some(initial_scratchpad);
+    let mut suspended: Option<SuspendedTurn> = None;
+    let mut deferred: VecDeque<AgentMessage> = VecDeque::new();
 
-    while let Some(msg) = inbox_rx.recv().await {
+    loop {
+        // Drain a deferred trigger when idle & nothing parked; else block on
+        // the inbox. Deferred messages are already in `history`.
+        let (msg, from_inbox) =
+            if suspended.is_none() && state.is_idle() && !deferred.is_empty() {
+                (deferred.pop_front().unwrap(), false)
+            } else {
+                match inbox_rx.recv().await {
+                    Some(m) => (m, true),
+                    None => break,
+                }
+            };
+        if from_inbox {
+            history.push(msg.clone());
+        }
+
         tracing::debug!(
             target: "aidock::agent",
             role = %role.id,
             in_kind = msg.kind.tag(),
             from = %msg.sender,
             state = state.tag(),
+            parked = suspended.is_some(),
             "inbox received"
         );
 
-        history.push(msg.clone());
-
-        // Did this message resolve an ASK we sent? Captured BEFORE absorbing
-        // so we can both transition state AND let `should_respond` know this
-        // is a "you just got the answer you were waiting for, think about
-        // next steps" situation.
-        let resolved_my_pending = matches!(
-            (&msg.kind, &state),
-            (
-                AgentMessageKind::Answer { reply_to, .. },
-                AgentState::WaitingAnswer { for_message, .. },
-            ) if reply_to == for_message
-        );
-
-        if resolved_my_pending {
-            state = AgentState::Idle;
-            tracing::debug!(
-                target: "aidock::agent",
-                role = %role.id,
-                "pending ASK resolved by incoming ANSWER"
-            );
-        }
-
-        // Trigger a think either because:
-        //   (a) the message is one our policy responds to, or
-        //   (b) it just answered a question we were waiting on.
-        let should_think = resolved_my_pending || should_respond(&role, &state, &msg);
-        if !should_think {
-            continue;
-        }
-
-        // Build the Level 0 context (Sprint 2.5) + scratchpad (Sprint 2.8).
-        let mut chat_messages = build_level_0_context(&role, &history, &msg, &scratchpad);
-
-        // Multi-turn LLM loop: query tools (Sprint 2.7) fetch data and feed
-        // back into the conversation; we stop as soon as the model emits at
-        // least one *action* tool call, or after MAX_QUERY_LOOP_ITERATIONS.
-        let mut iter = 0usize;
-        let emitted_action = loop {
-            iter += 1;
-            let req = ChatRequest {
-                model: role.model.primary.clone(),
-                messages: chat_messages.clone(),
-                temperature: Some(role.model.temperature),
-                max_tokens: Some(role.model.max_tokens),
-                tools: tools.clone(),
-                tool_choice: Some(json!("auto")),
-            };
-
-            let resp = match provider.chat_completion(req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(
-                        target: "aidock::agent",
-                        role = %role.id,
-                        error = %e,
-                        iter,
-                        "LLM call failed; agent stays silent this turn"
-                    );
-                    break false;
-                }
-            };
-
-            if resp.tool_calls.is_empty() {
-                tracing::warn!(
-                    target: "aidock::agent",
-                    role = %role.id,
-                    iter,
-                    content_preview = ?resp.content.as_deref().map(|s| &s[..s.len().min(120)]),
-                    "LLM returned no tool calls; turn skipped"
-                );
-                break false;
+        let suspended_ask = suspended.as_ref().map(|s| s.ask_id.as_str());
+        match classify_incoming(&role, &state, &msg, suspended_ask) {
+            Disposition::Ignore => continue,
+            Disposition::Defer => {
+                // One-turn-at-a-time: hold the trigger until the parked turn ends.
+                deferred.push_back(msg);
+                continue;
             }
-
-            // Unified per-tool execution. Every tool call yields a
-            // tool-role response that we feed back to the model; the turn
-            // ends only when at least one *terminal* message (BROADCAST,
-            // ASK_AGENT, ANSWER, DONE, SUMMARY) lands.
-            chat_messages.push(ChatMessage::Assistant {
-                content: resp.content.clone(),
-                tool_calls: resp.tool_calls.clone(),
-            });
-
-            let mut turn_terminated = false;
-            for tool_call in &resp.tool_calls {
-                let name = &tool_call.function.name;
-                let args = &tool_call.function.arguments;
-                let body = if is_query_tool(name) {
-                    execute_query_tool(name, args, &history)
-                        .unwrap_or_else(|e| format!("query failed: {e}"))
-                } else if is_scratchpad_tool(name) {
-                    match apply_scratchpad_update(&mut scratchpad, args) {
-                        Ok(confirmation) => {
-                            // Sprint 3: persist after every successful update.
-                            if let Err(e) = scratchpad.save(&scratchpad_path) {
-                                tracing::error!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    path = %scratchpad_path.display(),
-                                    error = %e,
-                                    "scratchpad in-memory updated but save FAILED — next restart loses this update"
-                                );
-                            } else {
-                                tracing::info!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    iter,
-                                    "{}", confirmation
-                                );
-                            }
-                            confirmation
-                        }
-                        Err(e) => format!("scratchpad update failed: {e}"),
-                    }
-                } else if is_mcp_tool(name) {
-                    // Sprint 4.6: gate destructive tools. Skipped entirely
-                    // in headless mode (no app_handle = no one to ask).
-                    let approval_outcome = if app_handle.is_some() {
-                        gate_mcp_call(
-                            &role.id,
-                            name,
-                            args,
-                            &approval,
-                            &pending_approvals,
-                            app_handle.as_ref(),
-                        )
-                        .await
-                    } else {
-                        ApprovalOutcome::Proceed
-                    };
-
-                    let body = match approval_outcome {
-                        ApprovalOutcome::Rejected(reason) => {
-                            tracing::info!(
-                                target: "aidock::agent",
-                                role = %role.id,
-                                tool = %name,
-                                "MCP call denied by user/policy"
-                            );
-                            format!("DENIED: {reason}")
-                        }
-                        ApprovalOutcome::Proceed => match mcp.as_ref() {
-                            Some(client) => match client.call_tool(name, args).await {
-                                Ok(body) => {
-                                    tracing::info!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        tool = %name,
-                                        iter,
-                                        body_len = body.len(),
-                                        "MCP tool returned"
-                                    );
-                                    body
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "aidock::agent",
-                                        role = %role.id,
-                                        tool = %name,
-                                        error = %e,
-                                        "MCP tool call failed"
-                                    );
-                                    format!("MCP tool '{name}' failed: {e}")
-                                }
-                            },
-                            None => format!(
-                                "MCP tool '{name}' is not available — the filesystem server didn't start this session"
-                            ),
-                        },
-                    };
-                    // Sprint 4.5: surface this call to the chat panel
-                    // even if it failed — users want to see the attempt,
-                    // not just the success. ALSO append to mcp_calls.jsonl
-                    // so reload doesn't lose tool-call history.
-                    let event = make_call_event(&role.id, name, args, &body, now_ms());
-                    if let Some(handle) = app_handle.as_ref() {
-                        if let Err(e) = handle.emit(MCP_CALL_EVENT, &event) {
-                            tracing::warn!(
-                                target: "aidock::agent",
-                                role = %role.id,
-                                error = %e,
-                                "failed to emit MCP call event"
-                            );
-                        }
-                    }
-                    if let Some(log) = mcp_log.as_ref() {
-                        log.record(event).await;
-                    }
-                    body
-                } else {
-                    // Protocol message tool (BROADCAST, ASK_AGENT, ANSWER,
-                    // WORK_START, PROGRESS, DONE, SUMMARY).
-                    match parse_tool_call(name, args) {
-                        Ok(parsed) => {
-                            let outgoing = build_outgoing(&role, parsed, Some(&msg.topic_id));
-                            apply_outgoing_state_transition(&mut state, &outgoing);
-                            // Sprint 2.4 fix: own emits go into local
-                            // history so the next think doesn't duplicate.
-                            history.push(outgoing.clone());
-                            let kind_for_term_check = outgoing.kind.clone();
-                            let tag = outgoing.kind.tag();
-
-                            if let Err(e) = dispatcher.submit(outgoing).await {
-                                tracing::error!(
-                                    target: "aidock::agent",
-                                    role = %role.id,
-                                    error = %e,
-                                    "dispatcher submit failed; agent stopping"
-                                );
-                                return;
-                            }
-
-                            if is_terminal_message_kind(&kind_for_term_check) {
-                                turn_terminated = true;
-                            }
-                            // For soft-actions (WORK_START / PROGRESS),
-                            // tell the model the dispatch happened and
-                            // it should continue — typically with the
-                            // fs__write_file calls that actually do the
-                            // work.
-                            if is_terminal_message_kind(&kind_for_term_check) {
-                                format!("{} dispatched to the team", tag)
-                            } else {
-                                format!(
-                                    "{} dispatched. Continue with the task — write your files via fs__ tools, then emit DONE when finished.",
-                                    tag
-                                )
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "aidock::agent",
-                                role = %role.id,
-                                tool = %name,
-                                error = %e,
-                                "could not parse tool call; skipped"
-                            );
-                            format!("could not parse '{name}': {e}")
-                        }
-                    }
+            Disposition::Resume => {
+                let parked = suspended.take().expect("Resume implies a parked turn");
+                let answer = match &msg.kind {
+                    AgentMessageKind::Answer { content, .. } => content.clone(),
+                    _ => String::new(),
                 };
-                chat_messages.push(ChatMessage::Tool {
-                    content: body,
-                    tool_call_id: tool_call.id.clone(),
-                });
+                state = AgentState::Idle; // drop WAITING_ANSWER before resuming
+                let mut plan_loop = parked.plan_loop;
+                let (outcome, turnstate) = plan_loop.resume(parked.state, answer).await;
+                handle_outcome(
+                    &role, &dispatcher, &mut state, &mut history, &mut scratchpad,
+                    &mut suspended, plan_loop, outcome, turnstate, parked.topic,
+                )
+                .await;
             }
-
-            if turn_terminated {
-                break true;
-            }
-            if iter >= MAX_QUERY_LOOP_ITERATIONS {
-                tracing::warn!(
-                    target: "aidock::agent",
-                    role = %role.id,
-                    "agent loop hit MAX_QUERY_LOOP_ITERATIONS without a terminal action — giving up this turn"
+            Disposition::StartTurn => {
+                let topic = msg.topic_id.clone();
+                let pad = scratchpad.take().expect("scratchpad present when idle");
+                // Build context BEFORE moving the scratchpad into the executor.
+                let context = build_level_0_context(&role, &history, &msg, &pad);
+                let source = LlmSource::new(
+                    provider.clone(),
+                    role.model.primary.clone(),
+                    role.model.temperature,
+                    role.model.max_tokens,
+                    tools.clone(),
+                    context,
                 );
-                break false;
+                let mcp_exec = McpExecutor::new(
+                    role.id.clone(),
+                    McpClientBackend { client: mcp.clone() },
+                    RealApprover {
+                        registry: approval.clone(),
+                        pending: pending_approvals.clone(),
+                        app_handle: app_handle.clone(),
+                    },
+                    RealCallSink {
+                        app_handle: app_handle.clone(),
+                        mcp_log: mcp_log.clone(),
+                    },
+                );
+                let composite = CompositeExecutor::new(
+                    mcp_exec,
+                    history.clone(),
+                    pad,
+                    scratchpad_path.clone(),
+                );
+                let mut plan_loop = PlanLoop::new(source, composite, AlwaysContinue, NullSink);
+                let (outcome, turnstate) = plan_loop.run_turn().await;
+                handle_outcome(
+                    &role, &dispatcher, &mut state, &mut history, &mut scratchpad,
+                    &mut suspended, plan_loop, outcome, turnstate, topic,
+                )
+                .await;
             }
-            // Otherwise loop: model gets to see all tool results in chat_messages
-            // and decide its next move (typically more fs__ writes or DONE).
-        };
-        let _ = emitted_action;
+        }
     }
 
     tracing::info!(target: "aidock::agent", role = %role.id, "agent task ended");
+}
+
+/// Apply a finished/suspended turn's effects to the dispatcher + state machine.
+/// This is the ③ side: it drains the turn's outward messages, emits the
+/// terminal/ASK message, transitions `AgentState`, and either reclaims the
+/// scratchpad (terminal) or parks the live loop (suspended).
+#[allow(clippy::too_many_arguments)]
+async fn handle_outcome(
+    role: &RoleConfig,
+    dispatcher: &DispatcherHandle,
+    state: &mut AgentState,
+    history: &mut Vec<AgentMessage>,
+    scratchpad: &mut Option<Scratchpad>,
+    suspended: &mut Option<SuspendedTurn>,
+    plan_loop: LiveLoop,
+    outcome: TurnOutcome,
+    mut turnstate: TurnState,
+    topic: TopicId,
+) {
+    // Drain outward messages (broadcasts / answers) the turn accumulated.
+    for out in turnstate.outgoing.drain(..) {
+        dispatch_kind(role, outbound_to_kind(out), &topic, dispatcher, state, history).await;
+    }
+
+    match outcome {
+        TurnOutcome::Done { summary } => {
+            dispatch_kind(
+                role,
+                AgentMessageKind::Done { summary, artifact_id: None },
+                &topic,
+                dispatcher,
+                state,
+                history,
+            )
+            .await; // transitions state → Idle
+            *scratchpad = Some(plan_loop.executor.into_scratchpad());
+        }
+        TurnOutcome::Escalated { reason } => {
+            // No human Esc in multi-agent; tell the team we're stuck.
+            dispatch_kind(
+                role,
+                AgentMessageKind::Broadcast {
+                    content: format!("⚠️ 我卡住了，需要帮助：{reason}"),
+                },
+                &topic,
+                dispatcher,
+                state,
+                history,
+            )
+            .await;
+            *state = AgentState::Idle;
+            *scratchpad = Some(plan_loop.executor.into_scratchpad());
+        }
+        TurnOutcome::Suspended { to, content, expected_format } => {
+            let ask_id = dispatch_kind(
+                role,
+                ask_to_kind(to, content, expected_format),
+                &topic,
+                dispatcher,
+                state,
+                history,
+            )
+            .await; // transitions state → WaitingAnswer{for_message: ask_id}
+            // Park the live loop (scratchpad rides inside it) until the answer.
+            *suspended = Some(SuspendedTurn {
+                plan_loop,
+                state: turnstate,
+                ask_id,
+                topic,
+            });
+        }
+    }
+}
+
+/// Build, state-transition, record, and dispatch one outgoing message.
+/// Returns the assigned message id (used to key WAITING_ANSWER on an ASK).
+async fn dispatch_kind(
+    role: &RoleConfig,
+    kind: AgentMessageKind,
+    topic: &TopicId,
+    dispatcher: &DispatcherHandle,
+    state: &mut AgentState,
+    history: &mut Vec<AgentMessage>,
+) -> String {
+    let outgoing = AgentMessage {
+        id: format!("m-{}", Uuid::new_v4()),
+        sender: role.id.clone(),
+        topic_id: topic.clone(),
+        timestamp: now_ms(),
+        kind,
+        opens_topic_title: None,
+    };
+    apply_outgoing_state_transition(state, &outgoing);
+    let id = outgoing.id.clone();
+    // Own emits go into local history so the next turn's context sees them.
+    history.push(outgoing.clone());
+    if let Err(e) = dispatcher.submit(outgoing).await {
+        tracing::error!(
+            target: "aidock::agent",
+            role = %role.id,
+            error = %e,
+            "dispatcher submit failed"
+        );
+    }
+    id
 }
 
 // ---------- response decision ----------
@@ -546,31 +512,60 @@ fn broadcast_mentions_me(role_id: &str, content: &str) -> bool {
     content.contains(role_id)
 }
 
+/// What to do with an incoming message given whether a turn is currently
+/// parked. The new ④.a turn host (CLAUDE.md #2b) layers two rules on top of
+/// `should_respond`:
+///   - **resume**: an ANSWER matching the parked ASK reopens that turn
+///   - **one-turn-at-a-time**: while a turn is parked, any *other* message
+///     that would normally trigger a think is deferred, not run concurrently
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// The ANSWER we were waiting on — resume the suspended turn.
+    Resume,
+    /// No turn in flight and policy says respond — start a fresh turn.
+    StartTurn,
+    /// A turn is parked; this would-trigger message waits its turn.
+    Defer,
+    /// Not for us right now.
+    Ignore,
+}
+
+/// Decide an incoming message's disposition. `suspended_ask_id` is `Some` iff a
+/// turn is currently parked waiting for the answer to that ASK message id.
+fn classify_incoming(
+    role: &RoleConfig,
+    state: &AgentState,
+    msg: &AgentMessage,
+    suspended_ask_id: Option<&str>,
+) -> Disposition {
+    if let Some(ask_id) = suspended_ask_id {
+        if let AgentMessageKind::Answer { reply_to, .. } = &msg.kind {
+            if reply_to == ask_id {
+                return Disposition::Resume;
+            }
+        }
+        // One-turn-at-a-time: a would-trigger message waits; the rest are FYI.
+        if should_respond(role, state, msg) {
+            Disposition::Defer
+        } else {
+            Disposition::Ignore
+        }
+    } else if should_respond(role, state, msg) {
+        Disposition::StartTurn
+    } else {
+        Disposition::Ignore
+    }
+}
+
 fn is_pm(role: &RoleConfig) -> bool {
     role.id == PM_ID
 }
 
 // ---------- assembling and tracking outgoing messages ----------
-
-fn build_outgoing(role: &RoleConfig, parsed: ParsedToolCall, latest_topic: Option<&TopicId>) -> AgentMessage {
-    let topic_id = parsed
-        .topic_id
-        .or_else(|| latest_topic.cloned())
-        .unwrap_or_else(|| format!("t-{}", Uuid::new_v4()));
-
-    // Only carry the title if the agent claimed THIS message opens a topic.
-    // Sprint 2.6: dispatcher stamps the title on the Topic on first sighting.
-    let opens_topic_title = parsed.new_topic_title;
-
-    AgentMessage {
-        id: format!("m-{}", Uuid::new_v4()),
-        sender: role.id.clone(),
-        topic_id,
-        timestamp: now_ms(),
-        kind: parsed.kind,
-        opens_topic_title,
-    }
-}
+//
+// (`build_outgoing` removed in the #2b cutover — `dispatch_kind` builds the
+// AgentMessage directly from a kind + the turn's topic. Topic-fallback /
+// new_topic_title logic returns when topic management is revisited.)
 
 fn apply_outgoing_state_transition(state: &mut AgentState, msg: &AgentMessage) {
     match &msg.kind {
@@ -602,17 +597,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// Result of the approval gate for one MCP tool call.
-enum ApprovalOutcome {
-    /// Either the tool was read-only, a prior decision approved, or the
-    /// user explicitly approved this request.
-    Proceed,
-    /// The user rejected, a prior decision rejected, or the request
-    /// timed out. `reason` is the string surfaced to the LLM as the
-    /// tool result body.
-    Rejected(String),
 }
 
 /// Run one tool through the approval gate. Returns immediately for
@@ -862,6 +846,69 @@ mod tests {
         assert!(!should_respond(&frontend_role(), &working, &msg));
     }
 
+    // ---------- classify_incoming (turn-host disposition, #2b) ----------
+
+    fn answer(reply_to: &str) -> AgentMessage {
+        AgentMessage::new(
+            "m-ans",
+            "backend_dev",
+            "t-1",
+            0,
+            AgentMessageKind::Answer {
+                reply_to: reply_to.into(),
+                content: "use JWT".into(),
+            },
+        )
+    }
+
+    fn waiting_on(ask_id: &str) -> AgentState {
+        AgentState::WaitingAnswer {
+            for_message: ask_id.into(),
+            since: 0,
+        }
+    }
+
+    #[test]
+    fn suspended_matching_answer_resumes() {
+        assert_eq!(
+            classify_incoming(&frontend_role(), &waiting_on("ask-99"), &answer("ask-99"), Some("ask-99")),
+            Disposition::Resume
+        );
+    }
+
+    #[test]
+    fn suspended_non_matching_answer_ignored() {
+        assert_eq!(
+            classify_incoming(&frontend_role(), &waiting_on("ask-99"), &answer("ask-other"), Some("ask-99")),
+            Disposition::Ignore
+        );
+    }
+
+    #[test]
+    fn suspended_directed_ask_is_deferred_not_run() {
+        // One-turn-at-a-time: a fresh directed ASK can't preempt a parked turn.
+        assert_eq!(
+            classify_incoming(&frontend_role(), &waiting_on("ask-99"), &ask("frontend_dev"), Some("ask-99")),
+            Disposition::Defer
+        );
+    }
+
+    #[test]
+    fn idle_directed_ask_starts_a_turn() {
+        assert_eq!(
+            classify_incoming(&frontend_role(), &AgentState::Idle, &ask("frontend_dev"), None),
+            Disposition::StartTurn
+        );
+    }
+
+    #[test]
+    fn idle_irrelevant_ask_ignored() {
+        assert_eq!(
+            classify_incoming(&frontend_role(), &AgentState::Idle, &ask("backend_dev"), None),
+            Disposition::Ignore
+        );
+    }
+
     #[test]
     fn outgoing_ask_transitions_to_waiting() {
         let mut state = AgentState::Idle;
@@ -913,54 +960,5 @@ mod tests {
         );
         apply_outgoing_state_transition(&mut state, &m2);
         assert!(state.is_idle());
-    }
-
-    #[test]
-    fn outgoing_carries_role_and_topic() {
-        let role = pm_role();
-        let parsed = ParsedToolCall {
-            kind: AgentMessageKind::Broadcast { content: "x".into() },
-            topic_id: Some("t-7".into()),
-            new_topic_title: None,
-        };
-        let m = build_outgoing(&role, parsed, None);
-        assert_eq!(m.sender, "PM");
-        assert_eq!(m.topic_id, "t-7");
-        assert!(m.id.starts_with("m-"));
-        assert!(m.opens_topic_title.is_none());
-    }
-
-    #[test]
-    fn outgoing_inherits_latest_topic_when_unset() {
-        let role = pm_role();
-        let parsed = ParsedToolCall {
-            kind: AgentMessageKind::Broadcast { content: "x".into() },
-            topic_id: None,
-            new_topic_title: None,
-        };
-        let latest = "t-existing".to_string();
-        let m = build_outgoing(&role, parsed, Some(&latest));
-        assert_eq!(m.topic_id, "t-existing");
-    }
-
-    #[test]
-    fn outgoing_carries_new_topic_title() {
-        // When the model declares it's opening a new topic, the title must
-        // flow through to the AgentMessage so the dispatcher can stamp it
-        // on the Topic.
-        let role = pm_role();
-        let parsed = ParsedToolCall {
-            kind: AgentMessageKind::Broadcast {
-                content: "kicking off frontend stack discussion".into(),
-            },
-            topic_id: Some("t-9".into()),
-            new_topic_title: Some("Frontend stack pick".into()),
-        };
-        let m = build_outgoing(&role, parsed, None);
-        assert_eq!(m.topic_id, "t-9");
-        assert_eq!(
-            m.opens_topic_title.as_deref(),
-            Some("Frontend stack pick")
-        );
     }
 }

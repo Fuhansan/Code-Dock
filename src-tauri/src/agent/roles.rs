@@ -27,9 +27,17 @@ pub const BACKEND_ID: &str = "backend_dev";
 /// future multi-agent-vs-single-agent A/B isolates the multi-agent
 /// mechanism's contribution from any model-tier advantage.
 fn shared_rules() -> &'static str {
-    "## House rules\n\
-     1. Every turn, call EXACTLY ONE tool. Never plain text. Never multiple tool calls.\n\
+    "## How a turn works (your inner ReAct loop — read this first)\n\
+     A turn is NOT one-and-done. You drive a loop until the work is delivered:\n   \
+        1. PLAN — call `set_plan(goal, steps)` first for any non-trivial task: lay out an ordered checklist. Re-call `set_plan` to mark steps done/failed or rewrite the plan as you learn. YOU own the step statuses — the runtime never advances them for you.\n   \
+        2. ACT — take ONE tool action toward the current step (write a file with fs__*, recall, update your scratchpad, or message the team).\n   \
+        3. OBSERVE — each tool's result comes back to you next step; use it to decide what to do next.\n   \
+        4. FINISH — when this turn's work is delivered, emit DONE. To get a teammate's input mid-task, emit ASK_AGENT: you PAUSE until they answer, then resume automatically right where you left off.\n     \
+        Crucial: sending a BROADCAST or ANSWER does NOT end your turn. Keep going (more tool calls) until you emit DONE — or ASK_AGENT to wait. A quick reply with nothing left to do is just: send it, then DONE.\n\n\
+     ## House rules\n\
+     1. Each STEP, call EXACTLY ONE tool — never bare plain text, never multiple tool calls in one step. A turn spans several steps; end it with DONE (or ASK_AGENT to wait on a teammate).\n\
      2. Pick the right tool:\n   \
+        - `set_plan` to lay out / update your checklist (see the loop above).\n   \
         - ANSWER replies to an ASK_AGENT directed at you (use its message id as reply_to).\n   \
         - ASK_AGENT when you need ONE specific teammate's input.\n   \
         - BROADCAST when the whole team needs to know.\n   \
@@ -48,7 +56,7 @@ fn shared_rules() -> &'static str {
      8. Two QUERY tools are available alongside the action tools:\n   \
         - `recall_topic(topic_id)` — pull the full message stream of a topic you only see summarised in your context. Use BEFORE acting if you genuinely need the detail.\n   \
         - `search_topic(topic_id, query)` — find matching messages in a topic by substring (case-insensitive).\n     \
-        Query tools return data to you and let you act next turn. They are not a substitute for the action tools — every turn must still end with one of BROADCAST / ASK_AGENT / ANSWER / WORK_START / PROGRESS / DONE / SUMMARY.\n\
+        Query tools return data to you, then the loop continues — they do NOT end your turn. Use them to inform your next step, then keep acting toward DONE.\n\
      9. One SCRATCHPAD tool:\n   \
         - `update_scratchpad(current_focus?, add_tasks?, add_files?, add_decisions?)` — write to your private notes. Only YOU see this; teammates don't. The runtime pins it to your prompt every turn so you don't forget. Use it when you decompose a task, commit to a non-obvious decision, or record a file you touched.\n     \
         Don't update the scratchpad every turn — only when something durable changed. After updating, emit your action tool on the NEXT turn.\n\
@@ -305,10 +313,26 @@ mod tests {
         for role in default_workshop() {
             assert!(
                 role.system_prompt.contains("EXACTLY ONE tool"),
-                "every role must inherit the one-tool-per-turn rule"
+                "every role must inherit the one-tool-per-step rule"
             );
             assert!(role.system_prompt.contains("ASK_AGENT"));
             assert!(role.system_prompt.contains("SUMMARY"));
+        }
+    }
+
+    #[test]
+    fn system_prompts_teach_the_react_loop() {
+        // The ReAct turn host (④.a) only pays off if the model knows to plan
+        // and that a turn spans many steps ending in DONE.
+        for role in default_workshop() {
+            assert!(
+                role.system_prompt.contains("set_plan"),
+                "every role must learn to plan with set_plan"
+            );
+            assert!(
+                role.system_prompt.contains("does NOT end your turn"),
+                "every role must learn BROADCAST/ANSWER don't end the turn"
+            );
         }
     }
 }

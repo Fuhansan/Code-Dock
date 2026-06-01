@@ -36,9 +36,13 @@ use serde::{Deserialize, Serialize};
 /// any success or replan, so it measures "stuck", not "ever failed".
 pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: usize = 3;
 
-/// N — total loop iterations before forced escalate. Runaway guard for a
-/// model that never commits to `Done` (e.g. SetPlan ↔ SetPlan flapping).
-pub const DEFAULT_MAX_TURN_ITERATIONS: usize = 24;
+/// N — total loop iterations before forced escalate. Pure runaway guard for a
+/// model that never commits to `Done` (e.g. SetPlan ↔ SetPlan flapping). Kept
+/// generous because real coding turns legitimately span many tool calls
+/// (scaffolding a project = 14+ file writes); the *consecutive-failure* guard
+/// (K) is what actually catches a stuck loop, so N can be loose.
+/// Bumped 24 → 80 after the first dev-test tripped it mid-project-scaffold.
+pub const DEFAULT_MAX_TURN_ITERATIONS: usize = 80;
 
 // ---------------------------------------------------------------------------
 // Data model (CLAUDE.md ④.a「数据模型」: Turn / Plan / Action / Observation)
