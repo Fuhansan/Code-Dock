@@ -5,9 +5,7 @@
     MESSAGE_EVENT,
     TOOL_CALL_EVENT,
     APPROVAL_REQUEST_EVENT,
-    startSession,
     sendUserMessage,
-    sessionStatus,
     loadMessageHistory,
     loadMcpCallHistory,
     respondToApproval,
@@ -65,7 +63,9 @@
   let sending = $state(false);
   let bootError = $state<string | null>(null);
   let sendError = $state<string | null>(null);
-  let ready = $state(false);
+  // ① 当前会话 id（由 +page 传入）。变化即重载历史；非空即可输入。
+  let { sessionId = '' }: { sessionId?: string } = $props();
+  const ready = $derived(!!sessionId);
 
   // Sprint 2.6: topic_id → human title. Populated as we see opens_topic_title
   // on incoming messages. Used for SUMMARY divider headings + topic break
@@ -130,10 +130,11 @@
     if (scrollRef) scrollRef.scrollTop = scrollRef.scrollHeight;
   }
 
-  onMount(async () => {
-    // Sprint 3 + Sprint 4 polish: load BOTH persisted streams (messages
-    // and MCP calls) FIRST so the user sees prior turns + prior tool
-    // calls immediately after a restart, before any live events arrive.
+  /** Load (or reload) the ACTIVE session's persisted streams into the timeline.
+   *  Clears first so switching sessions never mixes two sessions' streams.
+   *  (Session lifecycle — start/resume/new — is owned by +page; this component
+   *  just shows whichever session is active and reloads when `sessionId` changes.) */
+  async function loadHistory() {
     try {
       const [history, mcpHistory] = await Promise.all([
         loadMessageHistory(),
@@ -143,26 +144,26 @@
         })
       ]);
       const initial: TimelineItem[] = [];
+      const titles: Record<string, string> = {};
       for (const m of history) {
-        if (m.opens_topic_title && !topicTitles[m.topic_id]) {
-          topicTitles[m.topic_id] = m.opens_topic_title;
-        }
+        if (m.opens_topic_title) titles[m.topic_id] = m.opens_topic_title;
         initial.push({ kind: 'message', ts: m.timestamp, data: m });
       }
       for (const e of mcpHistory) {
         initial.push({ kind: 'mcp', ts: e.timestamp, data: e });
       }
       initial.sort((a, b) => a.ts - b.ts);
+      topicTitles = titles;
       timeline = initial;
       await scrollToBottom();
     } catch (e) {
-      // Non-fatal — fresh session simply returns []. A real load error
-      // surfaces here but shouldn't block subscribe + start.
       console.warn('load history failed:', e);
     }
+  }
 
-    // Subscribe BEFORE start_session so we don't miss any events the
-    // dispatcher emits during agent spin-up.
+  onMount(async () => {
+    // Subscribe once. Events flow from whichever session is currently active,
+    // so no re-subscription is needed on switch.
     try {
       unlistenMsg = await listen<AgentMessage>(MESSAGE_EVENT, async (event) => {
         const m = event.payload;
@@ -187,17 +188,14 @@
       );
     } catch (e) {
       bootError = e instanceof Error ? e.message : String(e);
-      return;
     }
+  });
 
-    try {
-      // start_session is idempotent; if a previous render already booted
-      // the session this is a no-op.
-      await startSession();
-      ready = await sessionStatus();
-    } catch (e) {
-      bootError = e instanceof Error ? e.message : String(e);
-    }
+  // Reload history whenever the active session changes (incl. the first set).
+  $effect(() => {
+    const sid = sessionId;
+    if (!sid) return;
+    loadHistory();
   });
 
   onDestroy(() => {

@@ -35,7 +35,7 @@ explicitly; usually the right answer is to fix the contract between them
   - **新建**（`new_session`）：全新空目录。
   - **续接**（`resume_session`）：已存在目录 → rehydrate **接着跑**：dispatcher 重灌 `messages.jsonl`、每 agent `derive_from_history` 重建状态机、scratchpad 重载、④.b 记忆就位。`start_session` = 启动时续接最近活跃、无则新建。
 - **切换**走唯一口子 `commands::switch_to`：先 drop 旧 `Session`（其 `Drop` **abort** 任务——drop `JoinHandle` 只 detach、不会停，故必须 abort）再 `Session::start` 新的；`AppState.active_dir` 记当前会话目录，`load_*_history`/`current_session` 都读它。
-- ② 命令：`new_session`/`resume_session`/`list_sessions`/`current_session`（+ `ipc.ts` 绑定）。① 会话选择 UI **待做**。
+- ② 命令：`new_session`/`resume_session`/`list_sessions`/`current_session`（+ `ipc.ts` 绑定）。① 会话选择 UI ✅：左栏「会话」列表 + 新建按钮（`+page.svelte`）；`ChatPanel` 接 `sessionId` prop、`$effect` 按会话重载历史（会话生命周期上移到 `+page`，面板只展示当前活跃会话）。切换 = `+page` 调 `resume_session`/`new_session` → 更新 `activeSessionId` → 面板重载。
 - **续接的一个边界**：agent 卡在 ReAct 回合中途的**在飞 `TurnState` 不恢复**（仅内存，见 ④.a TODO）——续接从历史重新判断，不精确接回那半圈。
 - **TODO（低优，无账号系统暂搁）**：`USER` 现写死 `default`（`commands.rs`），有真登录后换账号 id；`WORKSHOP` 写死 `ws-default`，多工作室编辑器（V0.3）落地后由用户建——路径布局已为这两层留位，届时不返工。
 

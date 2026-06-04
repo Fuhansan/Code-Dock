@@ -1,6 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { greet, providerStatus } from '$lib/ipc';
+  import {
+    greet,
+    providerStatus,
+    startSession,
+    currentSession,
+    listSessions,
+    newSession,
+    resumeSession,
+    type SessionMeta
+  } from '$lib/ipc';
   import ApiKeySetup from '$lib/components/ApiKeySetup.svelte';
   import ChatPanel from '$lib/components/ChatPanel.svelte';
 
@@ -10,6 +19,11 @@
 
   let backendOk = $state<boolean | null>(null);
   let keyConfigured = $state<boolean | null>(null); // null = unknown, before first check
+
+  // ① 会话(session lifecycle)：列表 + 当前活跃。后端命令见 commands.rs/③。
+  let sessions = $state<SessionMeta[]>([]);
+  let activeSessionId = $state('');
+  let sessionError = $state<string | null>(null);
 
   onMount(async () => {
     // Backend health (Sprint 0 contract)
@@ -21,6 +35,7 @@
     }
     // BYOK gate (Sprint 1 contract)
     await refreshKeyStatus();
+    if (keyConfigured) await initSession();
   });
 
   async function refreshKeyStatus() {
@@ -31,8 +46,52 @@
     }
   }
 
-  function handleKeySaved() {
+  async function handleKeySaved() {
     keyConfigured = true;
+    await initSession();
+  }
+
+  // 启动:续接最近活跃会话(无则新建),拉历史列表 + 标出当前。
+  async function initSession() {
+    try {
+      await startSession();
+      const cur = await currentSession();
+      activeSessionId = cur?.id ?? '';
+      await refreshSessions();
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function refreshSessions() {
+    try {
+      sessions = await listSessions();
+    } catch (e) {
+      console.warn('list sessions failed:', e);
+    }
+  }
+
+  // 新建一个完全空的会话。
+  async function onNewSession() {
+    try {
+      const meta = await newSession();
+      activeSessionId = meta.id;
+      await refreshSessions();
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // 续接某历史会话(接着上次跑)。
+  async function onSwitchSession(id: string) {
+    if (id === activeSessionId) return;
+    try {
+      await resumeSession(id);
+      activeSessionId = id;
+      await refreshSessions();
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
   }
 </script>
 
@@ -64,9 +123,27 @@
       </section>
 
       <section class="nav-section">
-        <h3 class="nav-title">会话</h3>
-        <ul class="nav-list muted">
-          <li class="nav-item">（首版单会话）</li>
+        <div class="nav-title-row">
+          <h3 class="nav-title">会话</h3>
+          <button class="mini-btn" onclick={onNewSession} title="新建会话" aria-label="新建会话">＋</button>
+        </div>
+        <ul class="nav-list">
+          {#each sessions as s (s.id)}
+            <li>
+              <button
+                class="nav-item session-item"
+                class:active={s.id === activeSessionId}
+                onclick={() => onSwitchSession(s.id)}
+                title={s.title}
+              >
+                <span class="session-title">{s.title}</span>
+                {#if s.message_count > 0}<span class="session-count">{s.message_count}</span>{/if}
+              </button>
+            </li>
+          {/each}
+          {#if sessions.length === 0}
+            <li class="nav-item muted">（暂无会话）</li>
+          {/if}
         </ul>
       </section>
 
@@ -83,7 +160,7 @@
     {#if keyConfigured === null}
       <div class="loading">正在加载…</div>
     {:else if keyConfigured}
-      <ChatPanel />
+      <ChatPanel sessionId={activeSessionId} />
     {:else}
       <div class="loading muted">请先配置 LLM Provider</div>
     {/if}
@@ -237,6 +314,59 @@
     background: #e8e8eb;
     border-left-color: #007aff;
     font-weight: 500;
+  }
+
+  .nav-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    margin-bottom: 6px;
+  }
+  .nav-title-row .nav-title {
+    margin: 0;
+    padding: 0;
+  }
+  .mini-btn {
+    background: transparent;
+    border: 1px solid #d0d0d2;
+    border-radius: 5px;
+    width: 20px;
+    height: 20px;
+    line-height: 1;
+    cursor: pointer;
+    color: #6e6e73;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .mini-btn:hover {
+    background: #ebebed;
+  }
+
+  /* Session rows are <button> for a11y, styled to match .nav-item. */
+  .session-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-left: 2px solid transparent;
+    font: inherit;
+    text-align: left;
+  }
+  .session-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .session-count {
+    flex: none;
+    font-size: 11px;
+    color: #8e8e93;
   }
 
   .center {
