@@ -14,6 +14,7 @@ use crate::agent::mcp::ToolCallEvent;
 use crate::agent::mcp_log::{read_mcp_calls, MCP_LOG_FILE};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
+use crate::agent::session_store::{self, SessionMeta};
 use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
@@ -42,6 +43,9 @@ pub enum CommandError {
 
     #[error("no active session — call start_session first")]
     NoActiveSession,
+
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
 }
 
 impl serde::Serialize for CommandError {
@@ -56,6 +60,10 @@ impl serde::Serialize for CommandError {
 /// running `Session`. Future versions extend this to a map keyed by session id.
 pub struct AppState {
     pub session: Mutex<Option<Session>>,
+    /// Directory of the currently-active session. Kept alongside `session` so
+    /// `load_*_history` / `current_session` target the active session's data
+    /// (not a hardcoded path). Always set/cleared together with `session`.
+    pub active_dir: Mutex<Option<PathBuf>>,
     /// Sprint 4.6: per-session approval registry for destructive MCP
     /// tools. Lives in AppState so the `respond_to_approval` command can
     /// reach it without going through the session lock.
@@ -68,6 +76,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             session: Mutex::new(None),
+            active_dir: Mutex::new(None),
             approval: ApprovalRegistry::new(),
             pending_approvals: new_pending_approvals(),
         }
@@ -137,36 +146,119 @@ pub async fn send_chat_message(
 
 // ---------- Multi-agent session (Sprint 2) ----------
 
-fn default_session_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".aidock").join("sessions").join("default")
-}
+// V0.1：单本地用户 + 单硬编码工作室。TODO（低优，无账号系统暂搁）：有真登录后
+// USER 换成账号 id；多工作室编辑器落地后 WORKSHOP 由用户建。路径布局
+// users/{USER}/workshops/{WORKSHOP}/sessions/{id} 已为这两层留好位，届时不返工。
+const USER: &str = session_store::DEFAULT_USER;
+const WORKSHOP: &str = session_store::DEFAULT_WORKSHOP;
 
-/// Start the V0.1 default workshop session (PM + frontend_dev + backend_dev).
-/// Idempotent: calling on an already-started session is a no-op.
-#[tauri::command]
-pub async fn start_session(
+/// Stop the current session (its `Drop` aborts the tasks) and start one at `dir`.
+/// The single chokepoint for start / new / resume so they all switch cleanly.
+async fn switch_to(
     app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    state: &AppState,
+    dir: PathBuf,
 ) -> Result<(), CommandError> {
-    let mut guard = state.session.lock().await;
-    if guard.is_some() {
-        tracing::debug!(target: "aidock::cmd", "start_session: already running");
-        return Ok(());
-    }
     let key = keyring_store::load_api_key("bailian")?
         .ok_or_else(|| CommandError::ProviderNotConfigured("bailian".to_string()))?;
+    // Drop the old session first so its agents stop before the new ones spawn.
+    {
+        *state.session.lock().await = None;
+    }
     let session = Session::start(
-        default_session_dir(),
+        dir.clone(),
         key,
         Some(app),
         state.approval.clone(),
         state.pending_approvals.clone(),
     )
     .await?;
-    *guard = Some(session);
-    tracing::info!(target: "aidock::cmd", "session started");
+    *state.session.lock().await = Some(session);
+    *state.active_dir.lock().await = Some(dir);
     Ok(())
+}
+
+/// Launch entrypoint (idempotent): if a session is already running, no-op;
+/// otherwise **resume the most-recently-active** session, or create a fresh one
+/// if there are none. (Continuing a past session = `Session::start` rehydrating
+/// its dir — history, agent state, scratchpad, ④.b memory all come back.)
+#[tauri::command]
+pub async fn start_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    if state.session.lock().await.is_some() {
+        tracing::debug!(target: "aidock::cmd", "start_session: already running");
+        return Ok(());
+    }
+    let dir = match session_store::list_sessions(USER, WORKSHOP).into_iter().next() {
+        Some(meta) => session_store::session_dir(USER, WORKSHOP, &meta.id),
+        None => session_store::session_dir(USER, WORKSHOP, &session_store::new_session_id()),
+    };
+    switch_to(app, &state, dir).await?;
+    tracing::info!(target: "aidock::cmd", "session started (resume-most-recent-or-new)");
+    Ok(())
+}
+
+/// Start a brand-new, empty session (switching away from the current one).
+#[tauri::command]
+pub async fn new_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<SessionMeta, CommandError> {
+    let id = session_store::new_session_id();
+    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    switch_to(app, &state, dir).await?;
+    tracing::info!(target: "aidock::cmd", session_id = %id, "new session created");
+    Ok(session_store::list_sessions(USER, WORKSHOP)
+        .into_iter()
+        .find(|m| m.id == id)
+        .unwrap_or(SessionMeta {
+            id,
+            title: "新会话".to_string(),
+            created_ms: 0,
+            last_active_ms: 0,
+            message_count: 0,
+        }))
+}
+
+/// Resume an existing session by id (continues from its persisted history).
+#[tauri::command]
+pub async fn resume_session(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    if !dir.is_dir() {
+        return Err(CommandError::SessionNotFound(id));
+    }
+    switch_to(app, &state, dir).await?;
+    tracing::info!(target: "aidock::cmd", session_id = %id, "session resumed");
+    Ok(())
+}
+
+/// History list: all sessions for the current user/workshop, newest first.
+#[tauri::command]
+pub async fn list_sessions() -> Result<Vec<SessionMeta>, CommandError> {
+    Ok(session_store::list_sessions(USER, WORKSHOP))
+}
+
+/// The currently-active session's metadata (`None` if none started yet).
+#[tauri::command]
+pub async fn current_session(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<SessionMeta>, CommandError> {
+    let dir = state.active_dir.lock().await.clone();
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let Some(id) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else {
+        return Ok(None);
+    };
+    Ok(session_store::list_sessions(USER, WORKSHOP)
+        .into_iter()
+        .find(|m| m.id == id))
 }
 
 /// Whether a session is currently running.
@@ -226,8 +318,13 @@ pub async fn respond_to_approval(
 /// Returns the full stream in arrival order. Malformed lines (typically a
 /// crash-truncated tail) are skipped silently by the underlying reader.
 #[tauri::command]
-pub async fn load_message_history() -> Result<Vec<AgentMessage>, CommandError> {
-    let path = default_session_dir().join("messages.jsonl");
+pub async fn load_message_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AgentMessage>, CommandError> {
+    let Some(dir) = state.active_dir.lock().await.clone() else {
+        return Ok(Vec::new()); // no active session yet
+    };
+    let path = dir.join("messages.jsonl");
     let msgs = persistence::read_jsonl_messages(&path).map_err(|e| {
         // Roll the persistence error up as a generic LLM-ish string for
         // the frontend. The real diagnosis is in the tracing logs.
@@ -242,8 +339,13 @@ pub async fn load_message_history() -> Result<Vec<AgentMessage>, CommandError> {
 /// so reloaded sessions can show prior tool-call cards too, not just
 /// messages.
 #[tauri::command]
-pub async fn load_mcp_call_history() -> Result<Vec<ToolCallEvent>, CommandError> {
-    let path = default_session_dir().join(MCP_LOG_FILE);
+pub async fn load_mcp_call_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ToolCallEvent>, CommandError> {
+    let Some(dir) = state.active_dir.lock().await.clone() else {
+        return Ok(Vec::new()); // no active session yet
+    };
+    let path = dir.join(MCP_LOG_FILE);
     let calls = read_mcp_calls(&path).map_err(|e| {
         CommandError::Llm(LLMError::Other(format!(
             "could not load MCP call history: {e}"

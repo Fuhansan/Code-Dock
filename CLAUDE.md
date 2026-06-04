@@ -22,9 +22,22 @@ explicitly; usually the right answer is to fix the contract between them
 - **The narrow waist**: this is the *only* surface that crosses ① ↔ ③/④. Changing a schema here means both sides must update in lockstep.
 
 ## ③ Agent 协作运行时
-- **Files**: `src-tauri/src/agent/runtime.rs` (dispatcher loop), `router.rs`, `message.rs`, `session.rs`, `persistence.rs`
-- **Owns**: multi-agent scheduling, state machine (IDLE / WORKING / WAITING_ANSWER), message routing, turn-taking, who speaks when
+- **Files**: `src-tauri/src/agent/runtime.rs` (dispatcher loop), `router.rs`, `message.rs`, `session.rs`, `session_store.rs`, `persistence.rs`
+- **Owns**: multi-agent scheduling, state machine (IDLE / WORKING / WAITING_ANSWER), message routing, turn-taking, who speaks when，**+ 会话生命周期**
 - **Does NOT own**: how a single agent "thinks" inside one turn, what its prompt looks like, which tools it has
+
+### ③ 会话生命周期（2026-06：多会话 + 重启/续接）
+
+**三层容纳**（路径管归属，切上层零碰撞）：`~/.aidock/users/{user}/workshops/{workshop}/sessions/{session}/`。一个会话目录下挂 `messages.jsonl` / `scratchpads/` / `tool_calls.jsonl` / `agents/{id}/memory/`（④.b）/ `workspace/`——**全随会话隔离**（路径都从 session_dir 派生，④.b 一行不改）。`session_store.rs` 管布局 + id 生成 + 历史列表（读时从目录派生：标题=首条用户消息、活跃=messages.jsonl mtime、条数=行数，**不写 meta 文件**）。
+
+- **会话 id** = `{unix_millis}_{uuid8}`：可排序、文件系统/URL 安全；人看的名字由派生标题承担。
+- **两个入口，同一机制**（都是 `Session::start(dir)`，差别只在喂哪个目录）：
+  - **新建**（`new_session`）：全新空目录。
+  - **续接**（`resume_session`）：已存在目录 → rehydrate **接着跑**：dispatcher 重灌 `messages.jsonl`、每 agent `derive_from_history` 重建状态机、scratchpad 重载、④.b 记忆就位。`start_session` = 启动时续接最近活跃、无则新建。
+- **切换**走唯一口子 `commands::switch_to`：先 drop 旧 `Session`（其 `Drop` **abort** 任务——drop `JoinHandle` 只 detach、不会停，故必须 abort）再 `Session::start` 新的；`AppState.active_dir` 记当前会话目录，`load_*_history`/`current_session` 都读它。
+- ② 命令：`new_session`/`resume_session`/`list_sessions`/`current_session`（+ `ipc.ts` 绑定）。① 会话选择 UI **待做**。
+- **续接的一个边界**：agent 卡在 ReAct 回合中途的**在飞 `TurnState` 不恢复**（仅内存，见 ④.a TODO）——续接从历史重新判断，不精确接回那半圈。
+- **TODO（低优，无账号系统暂搁）**：`USER` 现写死 `default`（`commands.rs`），有真登录后换账号 id；`WORKSHOP` 写死 `ws-default`，多工作室编辑器（V0.3）落地后由用户建——路径布局已为这两层留位，届时不返工。
 
 ## ④ 单 Agent 内部系统
 - **Files**: `src-tauri/src/agent/roles.rs`, `context.rs`, `scratchpad.rs`, `approval.rs`, auxiliary tools (recall/search/scratchpad)

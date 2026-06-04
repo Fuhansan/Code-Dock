@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod scratchpad;
 pub mod security;
 pub mod session;
+pub mod session_store;
 pub mod shell;
 pub mod state;
 pub mod tools;

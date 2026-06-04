@@ -56,6 +56,21 @@ pub struct Session {
     _mcp_log_task: Option<JoinHandle<()>>,
 }
 
+impl Drop for Session {
+    /// Abort the dispatcher + agent + log tasks so switching/closing a session
+    /// actually stops it. (Dropping a `JoinHandle` only *detaches* the task —
+    /// it keeps running — so for a clean session switch we must `abort()`.)
+    fn drop(&mut self) {
+        self._dispatcher_task.abort();
+        for t in &self._agent_tasks {
+            t.abort();
+        }
+        if let Some(t) = &self._mcp_log_task {
+            t.abort();
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error(transparent)]

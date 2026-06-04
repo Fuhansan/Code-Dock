@@ -191,3 +191,38 @@ export function loadMessageHistory(): Promise<AgentMessage[]> {
 export function loadMcpCallHistory(): Promise<McpCallEvent[]> {
   return invoke('load_mcp_call_history');
 }
+
+// ---------- 会话管理 (session lifecycle) ----------
+
+/** One session in the history list. Mirrors Rust `session_store::SessionMeta`.
+ *  Hierarchy: user → workshop → session; stored at
+ *  ~/.aidock/users/{user}/workshops/{ws}/sessions/{id}/. */
+export interface SessionMeta {
+  /** `{unix_millis}_{rand}` — sortable, filesystem-safe. */
+  id: string;
+  /** Derived from the first user message; "新会话" when empty. */
+  title: string;
+  created_ms: number;
+  last_active_ms: number;
+  message_count: number;
+}
+
+/** Start a brand-new, empty session (switches away from the current one). */
+export function newSession(): Promise<SessionMeta> {
+  return invoke('new_session');
+}
+
+/** Resume an existing session by id — continues from its persisted history. */
+export function resumeSession(id: string): Promise<void> {
+  return invoke('resume_session', { id });
+}
+
+/** History: all sessions for the current user/workshop, newest first. */
+export function listSessions(): Promise<SessionMeta[]> {
+  return invoke('list_sessions');
+}
+
+/** The currently-active session, or null if none started yet. */
+export function currentSession(): Promise<SessionMeta | null> {
+  return invoke('current_session');
+}
