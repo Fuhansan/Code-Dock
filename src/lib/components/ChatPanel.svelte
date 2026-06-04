@@ -1069,7 +1069,9 @@
     cursor: not-allowed;
   }
 
-  @media (prefers-color-scheme: dark) {
+  /* 自动深色已停用——固定浅色，避免界面随系统深色模式"乱变色"（用户要求）。
+     条件 max-width:0 永不匹配 = 整块失效；将来要深色/做切换时去掉这个条件即可。 */
+  @media (prefers-color-scheme: dark) and (max-width: 0px) {
     .banner.muted {
       background: #2c2c2e;
       color: #98989d;

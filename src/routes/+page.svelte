@@ -74,6 +74,12 @@
   // 新建一个完全空的会话。
   async function onNewSession() {
     try {
+      // 当前会话还是空的（没发过消息）就别再开新的——复用它，避免堆一堆空"新会话"。
+      const cur = await currentSession();
+      if (cur && cur.message_count === 0) {
+        activeSessionId = cur.id;
+        return;
+      }
       const meta = await newSession();
       activeSessionId = meta.id;
       await refreshSessions();
@@ -419,7 +425,9 @@
     text-align: left;
   }
 
-  @media (prefers-color-scheme: dark) {
+  /* 自动深色已停用——固定浅色，避免随系统深色模式"乱变色"（用户要求）。
+     max-width:0 永不匹配 = 整块失效；将来要深色/切换时去掉这个条件即可。 */
+  @media (prefers-color-scheme: dark) and (max-width: 0px) {
     :global(:root) {
       color: #f5f5f7;
       background-color: #1c1c1e;

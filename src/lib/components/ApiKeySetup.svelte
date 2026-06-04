@@ -208,7 +208,8 @@
     cursor: not-allowed;
   }
 
-  @media (prefers-color-scheme: dark) {
+  /* 自动深色已停用（用户要求，固定浅色）。max-width:0 永不匹配 = 整块失效。 */
+  @media (prefers-color-scheme: dark) and (max-width: 0px) {
     .modal {
       background: #2c2c2e;
       box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);

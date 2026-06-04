@@ -84,7 +84,9 @@ pub fn list_sessions(user: &str, workshop: &str) -> Vec<SessionMeta> {
             Some(meta_for(&e.path(), id))
         })
         .collect();
-    out.sort_by(|a, b| b.last_active_ms.cmp(&a.last_active_ms));
+    // 按**创建时间**倒序（新建的在上）。用 created（id 时间前缀，固定不变）而非
+    // last_active 排序，这样打开/切换会话**永不重排**——避免"开一个、别的下沉"。
+    out.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
     out
 }
 
@@ -192,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn list_derives_title_count_and_sorts_by_active() {
+    fn list_derives_title_count_and_sorts_by_created() {
         let (dir, user, ws) = tmp_sessions();
         // session 1: has a user message → title from it.
         let s1 = "1000_aaaaaaaa".to_string();
@@ -209,6 +211,9 @@ mod tests {
 
         let list = list_sessions(&user, &ws);
         assert_eq!(list.len(), 2);
+        // Sorted by created (newest first): s2 (created 2000) before s1 (1000).
+        assert_eq!(list[0].id, s2);
+        assert_eq!(list[1].id, s1);
         let m1 = list.iter().find(|m| m.id == s1).unwrap();
         assert_eq!(m1.title, "做一个登录页");
         assert_eq!(m1.message_count, 2);
