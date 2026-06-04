@@ -273,7 +273,7 @@ impl ResultJudge for AlwaysContinue {
 
 /// Observability seam (CLAUDE.md ④.a「可观测性」). The driver records
 /// milestone-level events here; real wiring forwards them onto a NEW ② event
-/// type (UI-only side channel, same treatment as MCP_CALL_EVENT). RED LINE:
+/// type (UI-only side channel, same treatment as TOOL_CALL_EVENT). RED LINE:
 /// whatever consumes these MUST NOT loop them back into any agent's LLM
 /// context — they are display/persistence only.
 pub trait ProgressSink {

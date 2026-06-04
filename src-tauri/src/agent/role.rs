@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::message::AgentId;
+use crate::agent::security::PermissionRule;
+use crate::agent::tools::SecurityLevel;
 
 /// Which provider+model pair this role uses, plus sampling knobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,30 +56,10 @@ impl Default for LoopMode {
     }
 }
 
-/// Which subset of filesystem MCP tools is advertised to this role. The
-/// runtime filters tools BEFORE the LLM ever sees them, so an agent
-/// without `None`-grade access literally cannot pick fs__write_file from
-/// its toolbox.
-///
-/// Sprint 4 design pivot: feedback from the first GUI run was that PM
-/// happily wrote files himself instead of delegating, even with a "you
-/// are not a coder" prompt rule. The correct fix is structural — don't
-/// hand PM the hammer in the first place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum McpAccess {
-    /// No MCP tools advertised. The agent gets only message + query +
-    /// scratchpad tools. Right default for coordinator-shaped roles.
-    #[default]
-    None,
-    /// Read-only filesystem tools (list / read / search / get_file_info).
-    /// Lets an agent inspect the workspace without being able to mutate
-    /// it. Useful for QA / review roles in future workshops.
-    ReadOnly,
-    /// Everything — read, write, edit, move, create_directory. Reserved
-    /// for engineering-shaped roles.
-    All,
-}
+// NOTE: 旧 `McpAccess`（None/ReadOnly/All）已删除。它把"给哪些工具"和"只读与否"
+// 揉成一个枚举；现在拆成 `RoleConfig.tools`（目录，逐名）+ `tools::SecurityLevel`
+// （策略）。三层防御 layer 2 的结构性门控 = 工具不在目录里就 advertise 不出去
+// （见 `tools::advertised_tools`）。
 
 /// Full role definition. The runtime reads this; the workshop editor (Sprint
 /// V0.3) will eventually write it. For V0.1 these are hardcoded in 2.2.
@@ -112,10 +94,16 @@ pub struct RoleConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_history_tokens: Option<u32>,
 
-    /// What slice of filesystem MCP tools (if any) this role can call.
-    /// Defaults to `None` — opt-in tool access, opt-out by omission.
+    /// 调用时把关的策略（CLAUDE.md ④.d 安全检查）：严格/标准/宽松，只挪 L1/L2 的
+    /// "放行↔问人"，碰不到 L3 红线。取代旧 `mcp_access`——"能拿到哪些工具"现在由
+    /// 上面的 `tools` 目录决定，这里只管"拿到的怎么把关"。
     #[serde(default)]
-    pub mcp_access: McpAccess,
+    pub security_level: SecurityLevel,
+
+    /// specifier 权限规则（CLAUDE.md ④.d）：如 `Bash(npm test*)` 免问、
+    /// `Read(*/.ssh/*)` 拒。级别策略之前短路（Deny 优先 / Allow 免问）。默认空。
+    #[serde(default)]
+    pub permission_rules: Vec<PermissionRule>,
 }
 
 #[cfg(test)]
@@ -151,18 +139,19 @@ mod tests {
             teammates: vec!["frontend_dev".into()],
             loop_mode: LoopMode::default(),
             max_history_tokens: None,
-            mcp_access: McpAccess::default(),
+            security_level: SecurityLevel::default(),
+            permission_rules: vec![],
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["id"], "PM");
         assert_eq!(v["model"]["provider"], "bailian");
         assert_eq!(v["loop_mode"], "single");
-        // Default mcp_access is None — coordinator-shaped roles must opt in.
-        assert_eq!(v["mcp_access"], "none");
+        // Default security_level is Standard.
+        assert_eq!(v["security_level"], "standard");
     }
 
     #[test]
-    fn mcp_access_default_is_none() {
-        assert_eq!(McpAccess::default(), McpAccess::None);
+    fn security_level_default_is_standard() {
+        assert_eq!(SecurityLevel::default(), SecurityLevel::Standard);
     }
 }

@@ -11,12 +11,21 @@
 //! stability harness verified the basic tool-call discipline; these prompts
 //! extend that with team awareness and topic discipline.
 
+use crate::agent::fs_tools::{TOOL_EDIT, TOOL_GLOB, TOOL_GREP, TOOL_READ, TOOL_WRITE};
+use crate::agent::llm_source::TOOL_SET_PLAN;
+use crate::agent::lsp::TOOL_LSP;
+use crate::agent::memory::TOOL_RECALL_DETAIL;
 use crate::agent::message::AgentId;
 use crate::agent::protocol::{
     TOOL_ANSWER, TOOL_ASK_AGENT, TOOL_BROADCAST, TOOL_DONE, TOOL_PROGRESS, TOOL_SUMMARY,
     TOOL_WORK_START,
 };
-use crate::agent::role::{Budget, LoopMode, McpAccess, ModelConfig, RoleConfig};
+use crate::agent::recall::{TOOL_RECALL_TOPIC, TOOL_SEARCH_TOPIC};
+use crate::agent::role::{Budget, LoopMode, ModelConfig, RoleConfig};
+use crate::agent::security::PermissionRule;
+use crate::agent::scratchpad::TOOL_UPDATE_SCRATCHPAD;
+use crate::agent::shell::{TOOL_BASH, TOOL_BASH_OUTPUT, TOOL_KILL_SHELL};
+use crate::agent::tools::SecurityLevel;
 
 pub const PM_ID: &str = "PM";
 pub const FRONTEND_ID: &str = "frontend_dev";
@@ -60,7 +69,7 @@ fn shared_rules() -> &'static str {
      9. One SCRATCHPAD tool:\n   \
         - `update_scratchpad(current_focus?, add_tasks?, add_files?, add_decisions?)` — write to your private notes. Only YOU see this; teammates don't. The runtime pins it to your prompt every turn so you don't forget. Use it when you decompose a task, commit to a non-obvious decision, or record a file you touched.\n     \
         Don't update the scratchpad every turn — only when something durable changed. After updating, emit your action tool on the NEXT turn.\n\
-    10. FILESYSTEM tools (prefix `fs__`): if these are advertised this session, you can ACTUALLY read and write files in the workspace dir. `fs__write_file` and `fs__edit_file` create real files on disk. When the team agrees a file should exist, emit `fs__write_file` instead of pasting the content as a BROADCAST. Tool results loop back to you so you can WORK_START / PROGRESS / DONE around the writes."
+    10. FILE tools (if advertised): `Read` (content with line numbers), `Edit` (exact old_string→new_string replacement), `Write` (create/overwrite a file), `Glob` (find files by name pattern), `Grep` (search file contents). These ACTUALLY read/write real files in the workspace. You MUST `Read` a file before you `Edit` it or overwrite it with `Write`. When the team agrees a file should exist, `Write` it instead of pasting content as a BROADCAST. Edits/writes are confined to the workspace (paths outside are refused); reads may range wider. Tool results loop back to you so you can WORK_START / PROGRESS / DONE around the writes."
 }
 
 fn shared_team_block(self_role: &str, teammates: &[&str]) -> String {
@@ -111,6 +120,81 @@ fn all_message_tools() -> Vec<String> {
     ]
 }
 
+/// 每个角色共有的工具目录（CLAUDE.md ④「工具调用系统」逐名目录）：消息工具 +
+/// 计划 + 查询/记忆/scratchpad。fs/shell 由各角色按需追加。
+fn common_tool_catalog() -> Vec<String> {
+    let mut v = all_message_tools();
+    v.push(TOOL_SET_PLAN.into());
+    v.push(TOOL_RECALL_TOPIC.into());
+    v.push(TOOL_SEARCH_TOPIC.into());
+    v.push(TOOL_UPDATE_SCRATCHPAD.into());
+    v.push(TOOL_RECALL_DETAIL.into());
+    v
+}
+
+/// 协调型角色（PM）：共有 + **只读**文件工具（Read/Glob/Grep）。没有 Edit/Write/shell
+/// ——三层防御 layer 2 的结构性门控就在这张目录里：写工具从不进它的工具表。
+fn coordinator_catalog() -> Vec<String> {
+    let mut v = common_tool_catalog();
+    v.push(TOOL_READ.into());
+    v.push(TOOL_GLOB.into());
+    v.push(TOOL_GREP.into());
+    v
+}
+
+/// 所有角色共有的 specifier 规则：拒读密钥（read 可越界，但密钥不给读——CLAUDE.md
+/// ④.d 记过的 CC 坑"别抄它默认不挡密钥"）。
+fn secrets_deny_rules() -> Vec<PermissionRule> {
+    vec![
+        PermissionRule::deny(TOOL_READ, "*/.ssh/*"),
+        PermissionRule::deny(TOOL_READ, "*/.aws/*"),
+        PermissionRule::deny(TOOL_GREP, "*/.ssh/*"),
+    ]
+}
+
+/// 工程师的 specifier 规则：拒密钥 + 常用"验证"命令免问 + 明确危险硬拒。
+/// allow 是 best-effort 便利（减少"每条命令都问"的痛）；deny 是 best-effort 防御
+/// （命令串可绕，不是墙——见 CLAUDE.md ④.d）。
+fn engineer_permission_rules() -> Vec<PermissionRule> {
+    let mut r = secrets_deny_rules();
+    for cmd in [
+        "ls*",
+        "cat *",
+        "pwd*",
+        "echo *",
+        "git status*",
+        "git diff*",
+        "git log*",
+        "cargo check*",
+        "cargo test*",
+        "cargo build*",
+        "pytest*",
+        "npm test*",
+        "npm run build*",
+    ] {
+        r.push(PermissionRule::allow(TOOL_BASH, cmd));
+    }
+    r.push(PermissionRule::deny(TOOL_BASH, "sudo *"));
+    r.push(PermissionRule::deny(TOOL_BASH, "rm -rf /*"));
+    r.push(PermissionRule::deny(TOOL_BASH, "rm -rf ~*"));
+    r
+}
+
+/// 工程型角色：共有 + 全套文件工具（Read/Edit/Write/Glob/Grep）+ shell。
+fn engineer_catalog() -> Vec<String> {
+    let mut v = common_tool_catalog();
+    v.push(TOOL_READ.into());
+    v.push(TOOL_EDIT.into());
+    v.push(TOOL_WRITE.into());
+    v.push(TOOL_GLOB.into());
+    v.push(TOOL_GREP.into());
+    v.push(TOOL_LSP.into());
+    v.push(TOOL_BASH.into());
+    v.push(TOOL_BASH_OUTPUT.into());
+    v.push(TOOL_KILL_SHELL.into());
+    v
+}
+
 // ---------- PM ----------
 
 fn pm_system_prompt() -> String {
@@ -121,7 +205,7 @@ fn pm_system_prompt() -> String {
     format!(
         "You are the Product Manager (\"PM\") in AiDock, a multi-agent AI software team.\n\n\
          ## Your identity\n\
-         You are a PRODUCT person. You think in user value, requirements, scope, and trade-offs. You do NOT write code, do NOT edit files, do NOT execute commands. Even though filesystem tools (fs__*) may technically be advertised to you, they exist for the engineers, not for you — just like a real PM has VS Code on their laptop but never opens it on the team's behalf.\n\n\
+         You are a PRODUCT person. You think in user value, requirements, scope, and trade-offs. You do NOT write code, edit files, create files, or run commands. You have READ-ONLY file access — you may open and read the team's files to review and coordinate, but the write/edit/delete tools are not yours (they're not even given to you). Delivering code is the engineers' job; your job is to make sure the right thing gets built by the right person.\n\n\
          ## What you actually do\n\
          - Have a conversation with the customer to clarify what they want.\n\
          - Decompose the customer's intent into clear pieces of work and assign each piece to the right engineer by role id (frontend_dev / backend_dev).\n\
@@ -132,7 +216,7 @@ fn pm_system_prompt() -> String {
          - Decide a technical implementation detail on the engineer's behalf if the engineer hasn't been asked. (Suggest, don't dictate.)\n\
          - Re-broadcast the requirement after every nudge from the customer. (House rule 5.)\n\
          - Emit SUMMARY just because agreement was reached. Wait until DONE messages have landed. (House rule 6.)\n\n\
-         If you ever notice yourself about to call `fs__*` — STOP. The right action is BROADCAST or ASK_AGENT to the engineer who owns that file.\n\n\
+         When something needs to be written, built, RUN, or VERIFIED, do NOT do it yourself — you have no code editor and no shell. ASK_AGENT the engineer who owns it (frontend_dev / backend_dev). ESPECIALLY: if the user asks to RUN or VERIFY code (e.g. \"run fib.py and show the output\"), delegate it to an engineer who will ACTUALLY execute it in the sandbox. NEVER 'compute / infer the output by reading the code yourself' — that is a guess, not verification; hand it to an engineer to run for real and report the true output. If the request is unclear, clarify it (BROADCAST a question) before assigning — understand the intent first, don't just relay the literal words.\n\n\
          {team}\n\
          {rules}",
         team = team,
@@ -148,19 +232,32 @@ pub fn pm_role() -> RoleConfig {
         system_prompt: pm_system_prompt(),
         model: baseline_model(),
         budget: baseline_budget(),
-        tools: all_message_tools(),
+        tools: coordinator_catalog(),
         teammates: vec![FRONTEND_ID.into(), BACKEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
-        // Capability-wise PM has the same toolbelt as engineers — the
-        // workshop is a real software team where everyone CAN open the
-        // editor, just like a real PM has VS Code installed. What stops
-        // PM from writing code is his ROLE IDENTITY (system_prompt), not
-        // a hard tool lock. The `McpAccess` knob exists for workshops
-        // that DO want tighter scoping, but the V0.1 default workshop
-        // trusts the identity boundary the way a real org would.
-        mcp_access: McpAccess::All,
+        // 三层防御 (CLAUDE.md ④「角色能力三层防御」), layer 2 = tool-gating:
+        // PM 的只读现在由**目录**决定——`coordinator_catalog()` 给 Read/Glob/Grep
+        // (只读)，不给 Edit/Write/shell，于是写/改/删工具从不进它的工具表，*结构上
+        // 写不了代码*。身份-only（mcp_access: All + "请别"）已证伪（dev-test
+        // 2026-06-02: PM 自己写了 todo.py）。security_level 只管"拿到的怎么把关"。
+        security_level: SecurityLevel::Standard,
+        permission_rules: secrets_deny_rules(),
     }
+}
+
+/// Shared note for engineer roles: they have a sandboxed `shell` tool and
+/// should use it to actually run + verify their work. (Layer-1 prompt half of
+/// the shell capability; the tool gate + sandbox are layers 2/3.)
+fn engineer_shell_note() -> &'static str {
+    "## Running & verifying your work\n\
+     You have a `Bash` tool — USE IT to actually run what you build and verify it works, don't \
+     just write files and assume. Run scripts (`python3 fib.py`), tests, builds, installs. The \
+     working directory is the workspace. Foreground commands wait for the result; for \
+     long-running processes (e.g. a dev server) pass run_in_background=true — you get a \
+     shell_id, poll it with `BashOutput` and stop it with `KillShell`. After writing code, run \
+     it; if the output is wrong, fix it before reporting done. Never claim you \"can't run \
+     commands\" — you can."
 }
 
 // ---------- frontend_dev ----------
@@ -176,8 +273,10 @@ fn frontend_system_prompt() -> String {
          - Implement the user-facing interface based on the PM's requirements.\n\
          - Coordinate with backend_dev on data shapes and API contracts.\n\
          - Be honest about technical constraints when PM proposes something fragile.\n\n\
+         {shell}\n\
          {team}\n\
          {rules}",
+        shell = engineer_shell_note(),
         team = team,
         rules = shared_rules(),
     )
@@ -191,13 +290,14 @@ pub fn frontend_role() -> RoleConfig {
         system_prompt: frontend_system_prompt(),
         model: baseline_model(),
         budget: baseline_budget(),
-        tools: all_message_tools(),
+        tools: engineer_catalog(),
         teammates: vec![PM_ID.into(), BACKEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
-        // Engineers need full filesystem access — read existing code,
-        // write new files, edit, organise.
-        mcp_access: McpAccess::All,
+        // 工程师拿全套文件工具 + shell（`engineer_catalog()`）。security_level
+        // 默认标准：区内改动直接落盘、Bash 问人、越界永拒。
+        security_level: SecurityLevel::Standard,
+        permission_rules: engineer_permission_rules(),
     }
 }
 
@@ -214,8 +314,10 @@ fn backend_system_prompt() -> String {
          - Implement server-side logic, data models, and APIs based on PM's requirements.\n\
          - Coordinate with frontend_dev on API contracts before either side codes against them.\n\
          - Be honest about technical constraints when PM proposes something fragile.\n\n\
+         {shell}\n\
          {team}\n\
          {rules}",
+        shell = engineer_shell_note(),
         team = team,
         rules = shared_rules(),
     )
@@ -229,13 +331,13 @@ pub fn backend_role() -> RoleConfig {
         system_prompt: backend_system_prompt(),
         model: baseline_model(),
         budget: baseline_budget(),
-        tools: all_message_tools(),
+        tools: engineer_catalog(),
         teammates: vec![PM_ID.into(), FRONTEND_ID.into()],
         loop_mode: LoopMode::Single,
         max_history_tokens: Some(32_000),
-        // Same rationale as frontend: engineering roles get full
-        // filesystem access.
-        mcp_access: McpAccess::All,
+        // 同 frontend：工程型角色拿全套文件工具 + shell。
+        security_level: SecurityLevel::Standard,
+        permission_rules: engineer_permission_rules(),
     }
 }
 

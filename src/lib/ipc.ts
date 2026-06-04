@@ -84,9 +84,10 @@ export function sendChatMessage(params: SendChatParams): Promise<ChatResponse> {
 /** Tauri event name the dispatcher emits for every routed message. */
 export const MESSAGE_EVENT = 'aidock:message';
 
-/** Tauri event name the agent runtime emits per executed MCP tool call
- *  (Sprint 4.5). One event per call, success or error. */
-export const MCP_CALL_EVENT = 'aidock:mcp_call';
+/** Tauri event name the agent runtime emits per executed tool call (step 5:
+ *  generalized from MCP-only to ALL Call tools — file Read/Edit/Write/Glob/Grep,
+ *  Bash, recall, MCP). One event per call, success or error. */
+export const TOOL_CALL_EVENT = 'aidock:tool_call';
 
 /** Sprint 4.6: emitted when the agent runtime needs the user's vote on
  *  a destructive tool call. Frontend should respond via `respondToApproval`. */
@@ -110,7 +111,12 @@ export function respondToApproval(id: string, decision: ApprovalDecision): Promi
   return invoke('respond_to_approval', { id, decision });
 }
 
-/** Live MCP tool-call notification. Mirrors Rust `McpCallEvent`. */
+/** Live MCP tool-call notification. Mirrors Rust `McpCallEvent`.
+ *
+ *  Sprint 4.7: `args` / `result` now carry the FULL payload. Per-tool
+ *  formatters in the chat panel pick the one-line summary; the user
+ *  expands the row to see the raw body. A 1 MiB cap on the Rust side
+ *  is the only ceiling, present just as a runaway-tool safety net. */
 export interface McpCallEvent {
   id: string;
   /** Unix milliseconds, same clock as AgentMessage so timelines sort cleanly. */
@@ -119,10 +125,10 @@ export interface McpCallEvent {
   agent: string;
   /** Full tool name including `fs__` prefix. */
   tool: string;
-  /** Truncated JSON args (≤ ~200 chars, '…' suffix when over). */
-  args_preview: string;
-  /** Truncated result body. */
-  result_preview: string;
+  /** Full JSON args (or near-full — Rust caps at 1 MiB as a safety net). */
+  args: string;
+  /** Full result body from the MCP server. */
+  result: string;
   /** False iff the result began with "ERROR:". */
   success: boolean;
 }

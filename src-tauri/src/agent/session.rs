@@ -19,12 +19,12 @@
 
 use std::path::PathBuf;
 
-use tokio::process::Command;
 use tokio::task::JoinHandle;
 
 use crate::agent::approval::{ApprovalRegistry, PendingApprovals};
 use crate::agent::dispatcher::{filter_visible_to, Dispatcher, DispatcherError, DispatcherHandle};
-use crate::agent::mcp::{McpClient, McpError};
+use crate::agent::lsp_pool::LspPool;
+use crate::agent::mcp::McpClient;
 use crate::agent::mcp_log::{spawn_writer as spawn_mcp_log_writer, McpLogHandle, MCP_LOG_FILE};
 use crate::agent::message::{AgentMessage, TopicId};
 use crate::agent::roles::default_workshop;
@@ -36,8 +36,9 @@ use crate::agent::state::AgentState;
 /// driven by Agents declaring `new_topic_title`.
 pub const DEFAULT_TOPIC_ID: &str = "t-default";
 
-/// Subdirectory under each session where filesystem MCP server is sandboxed.
-/// Agents write real code here — outside is denied by the server itself.
+/// Subdirectory under each session that is the agents' trusted workspace.
+/// Agents write real code here — the native file tools' L3 confinement
+/// (`fs_tools::within_workspace`) denies writes/deletes outside it.
 pub const WORKSPACE_SUBDIR: &str = "workspace";
 
 /// Holds the dispatcher handle plus the JoinHandles of every spawned task.
@@ -72,9 +73,9 @@ pub enum SessionError {
 }
 
 /// Ensure `session_dir/workspace/` exists and return its canonical path.
-/// Sprint 4.4: canonicalize because the filesystem MCP server matches
-/// allowed dirs against canonical paths (the macOS /var → /private/var
-/// symlink would otherwise look like a path-traversal attempt).
+/// Canonicalize because the native file tools' confinement check matches the
+/// target against the canonical workspace root (the macOS /var → /private/var
+/// symlink would otherwise look like a path-traversal escape).
 async fn ensure_workspace_dir(session_dir: &PathBuf) -> Result<PathBuf, SessionError> {
     let raw = session_dir.join(WORKSPACE_SUBDIR);
     tokio::fs::create_dir_all(&raw)
@@ -89,34 +90,18 @@ async fn ensure_workspace_dir(session_dir: &PathBuf) -> Result<PathBuf, SessionE
     })
 }
 
-/// Build the command that launches the Node-based reference filesystem
-/// MCP server, scoped to `workspace`. Pure factory — no spawning yet,
-/// kept separate so tests can inspect what we'd run without doing it.
-fn build_filesystem_mcp_command(workspace: &PathBuf) -> Command {
-    let mut cmd = Command::new("npx");
-    cmd.args([
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        workspace.to_string_lossy().as_ref(),
-    ]);
-    cmd
-}
-
-async fn spawn_filesystem_mcp(workspace: &PathBuf) -> Result<McpClient, McpError> {
-    let cmd = build_filesystem_mcp_command(workspace);
-    McpClient::start(cmd).await
-}
+// 旧的 `build_filesystem_mcp_command` / `spawn_filesystem_mcp` 已删除——参考文件
+// MCP 服务器不再自动启动（见 `Session::start` 内说明）。将来接用户自配 MCP 服务器时
+// 再按配置重建启动逻辑。
 
 impl Session {
     /// Build a Session: open the dispatcher (which rehydrates from disk),
-    /// spawn the filesystem MCP server scoped to the session's workspace
-    /// dir, then for each role in the default workshop derive its restored
-    /// state, load its scratchpad, and spawn its runtime with the MCP
-    /// handle.
+    /// then for each role in the default workshop derive its restored state,
+    /// load its scratchpad, and spawn its runtime.
     ///
-    /// MCP spawn is best-effort — if `npx` is missing or the server
-    /// fails to initialise, the session continues without filesystem
-    /// access (agents become chat-only). The session logs why.
+    /// File access is via native tools (`fs_tools.rs`), so no MCP server is
+    /// started here (`mcp = None`); the MCP plumbing stays for future
+    /// user-configured `mcp__` servers.
     ///
     /// Pass `None` for `app_handle` to run headless (dev harnesses).
     pub async fn start(
@@ -144,28 +129,17 @@ impl Session {
             .map(|(h, t)| (Some(h), Some(t)))
             .map_err(SessionError::McpLog)?;
 
-        // Sprint 4.2: spawn filesystem MCP server. Best-effort — on
-        // failure agents simply have no filesystem tools available.
-        let mcp = match spawn_filesystem_mcp(&workspace_dir).await {
-            Ok(client) => {
-                tracing::info!(
-                    target: "aidock::session",
-                    tool_count = client.advertised_tools().len(),
-                    workspace = %workspace_dir.display(),
-                    "filesystem MCP server ready"
-                );
-                Some(client)
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "aidock::session",
-                    error = %e,
-                    workspace = %workspace_dir.display(),
-                    "filesystem MCP server failed to start — agents will run chat-only"
-                );
-                None
-            }
-        };
+        // ④ 工具系统重定义（2026-06）：文件操作改走**原生** Read/Edit/Write/Glob/Grep
+        // （`fs_tools.rs`），不再用 Node 参考文件服务器 `@modelcontextprotocol/server-filesystem`。
+        // 它的工具已不进任何角色目录、永远 advertise 不出去，再起它就是白占一个 npx
+        // 子进程。这里**不再自动起它**。MCP 管道（`McpClient`/`McpClientBackend`/
+        // `CompositeExecutor` 的统一安全检查路由）保留，留给将来"用户自配 mcp__ 服务器"，
+        // 届时把 `None` 换成真正按用户配置启动的客户端即可。
+        let mcp: Option<McpClient> = None;
+
+        // ④ LSP：会话级 server 池，所有 agent 共享一份（Arc）。语言服务器懒启动、跨
+        // agent/回合复用（rust-analyzer 索引昂贵，不能每 agent 各起一个）。
+        let lsp_pool = LspPool::new(workspace_dir.clone());
 
         let mut agent_tasks = Vec::new();
         for role in default_workshop() {
@@ -176,6 +150,8 @@ impl Session {
             let initial_state = AgentState::derive_from_history(&visible, &role.id);
             let scratchpad_path = scratchpad_dir.join(format!("{}.json", role.id));
             let initial_scratchpad = Scratchpad::load(&scratchpad_path);
+            // ④.b memory: {session}/agents/{id}/memory (per CLAUDE.md ④.b).
+            let memory_root = session_dir.join("agents").join(&role.id).join("memory");
 
             tracing::info!(
                 target: "aidock::session",
@@ -199,6 +175,9 @@ impl Session {
                 initial_state,
                 initial_scratchpad,
                 scratchpad_path,
+                memory_root,
+                workspace_dir: workspace_dir.clone(),
+                lsp_pool: lsp_pool.clone(),
                 mcp: mcp.clone(),
                 app_handle: app_handle_for_agents.clone(),
                 approval: approval.clone(),

@@ -14,7 +14,12 @@
 pub mod approval;
 pub mod context;
 pub mod dispatcher;
+pub mod fs_tools;
 pub mod llm_source;
+pub mod lsp;
+pub mod lsp_client;
+pub mod lsp_pool;
+pub mod memory;
 pub mod mcp;
 pub mod mcp_executor;
 pub mod mcp_log;
@@ -27,8 +32,11 @@ pub mod role;
 pub mod roles;
 pub mod runtime;
 pub mod scratchpad;
+pub mod security;
 pub mod session;
+pub mod shell;
 pub mod state;
+pub mod tools;
 pub mod topic;
 pub mod turn_bridge;
 

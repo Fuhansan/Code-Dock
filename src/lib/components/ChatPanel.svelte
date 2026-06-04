@@ -3,7 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     MESSAGE_EVENT,
-    MCP_CALL_EVENT,
+    TOOL_CALL_EVENT,
     APPROVAL_REQUEST_EVENT,
     startSession,
     sendUserMessage,
@@ -172,8 +172,8 @@
         insertItem({ kind: 'message', ts: m.timestamp, data: m });
         await scrollToBottom();
       });
-      // Sprint 4.5: MCP tool calls flow on a separate Tauri event.
-      unlistenMcp = await listen<McpCallEvent>(MCP_CALL_EVENT, async (event) => {
+      // step 5: ALL tool calls (file/Bash/recall/MCP) flow on this Tauri event.
+      unlistenMcp = await listen<McpCallEvent>(TOOL_CALL_EVENT, async (event) => {
         const e = event.payload;
         insertItem({ kind: 'mcp', ts: e.timestamp, data: e });
         await scrollToBottom();
@@ -268,29 +268,13 @@
     return kind.type === 'SUMMARY' ? kind.key_decisions : [];
   }
 
-  // Sprint 4.5 polish: render MCP calls in a Claude Code-ish style —
-  // `● tool(key_arg)` + indented `⎿  short summary`. Verbose args are
-  // available on hover via the `title` attribute so the user can still
-  // see the full payload when needed.
+  // Sprint 4.7: per-tool formatters. Backend now ships full args/result
+  // in the event; UI picks a Claude-Code-style one-liner here and lets
+  // the user click to expand the row for the raw body. Each `case` is
+  // intentionally small so adding a new MCP tool is a one-place change.
 
   function shortTool(t: string): string {
     return t.replace(/^fs__/, '');
-  }
-
-  /** Try to extract the most relevant single argument for display.
-   *  Most filesystem tools take a `path`; search tools take a `query`.
-   *  Falls back to empty when args_preview was truncated mid-quote. */
-  function keyArg(toolName: string, argsPreview: string): string {
-    // Path-style tools (everything that touches a file or directory).
-    const pathMatch = argsPreview.match(/"path"\s*:\s*"([^"]+)"/);
-    if (pathMatch) return basename(pathMatch[1]);
-    // search_files / search_topic-style
-    const queryMatch = argsPreview.match(/"(?:query|pattern)"\s*:\s*"([^"]+)"/);
-    if (queryMatch) return queryMatch[1];
-    // move_file uses source/destination
-    const srcMatch = argsPreview.match(/"source"\s*:\s*"([^"]+)"/);
-    if (srcMatch) return basename(srcMatch[1]);
-    return '';
   }
 
   function basename(p: string): string {
@@ -299,29 +283,150 @@
     return name || p; // handle trailing slash
   }
 
-  /** Compact one-line result summary. Distinguishes denied / errored /
-   *  successful, and pulls a useful number out of the body when possible
-   *  (bytes written, file count, line count). */
-  function resultSummary(call: McpCallEvent): string {
-    const r = call.result_preview.trim();
-    if (r.startsWith('DENIED:')) return r;
-    if (r.startsWith('ERROR:')) {
-      // Strip ERROR prefix + take the first short reason line.
-      const tail = r.slice('ERROR:'.length).trim();
-      return tail.split('\n')[0].slice(0, 80);
+  function parseArgs(raw: string): Record<string, unknown> {
+    try {
+      const v = JSON.parse(raw);
+      return v && typeof v === 'object' && !Array.isArray(v)
+        ? (v as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
     }
-    // Successful — pick a representative one-liner.
-    // "Successfully wrote to /path" → "wrote /path"
-    const wrote = r.match(/Successfully wrote to (\S+)/);
-    if (wrote) return `wrote ${basename(wrote[1])}`;
-    // Numbered counts ("3 files in directory", "12 matches", ...)
-    const counted = r.match(/^(\d+)\s+(\w[\w ]*)/);
-    if (counted) return `${counted[1]} ${counted[2]}`;
-    // Allowed dirs result starts with "Allowed directories:"
-    if (r.startsWith('Allowed directories')) return 'allowed dirs listed';
-    // Fallback: first line, truncated.
-    const first = r.split('\n')[0];
-    return first.length > 80 ? first.slice(0, 80) + '…' : first;
+  }
+
+  function str(v: unknown): string {
+    return typeof v === 'string' ? v : '';
+  }
+
+  function clip(s: string, max = 200): string {
+    return s.length > max ? s.slice(0, max) + '…' : s;
+  }
+
+  /** Per-row display state. `head` lands next to the tool name as
+   *  `tool(head)`; `summary` is the indented `⎿` line. */
+  type Formatted = { head: string; summary: string };
+
+  function formatCall(c: McpCallEvent): Formatted {
+    const tool = shortTool(c.tool);
+    const args = parseArgs(c.args);
+    const result = c.result.trim();
+
+    // Failure paths bypass per-tool formatting — the user wants to see
+    // *why* it failed, not "+12 lines".
+    if (result.startsWith('DENIED:')) {
+      return { head: argLabel(args), summary: clip(result) };
+    }
+    if (result.startsWith('ERROR:')) {
+      const tail = result.slice('ERROR:'.length).trim();
+      return { head: argLabel(args), summary: clip(tail.split('\n')[0]) };
+    }
+
+    switch (tool) {
+      case 'write_file': {
+        // Create/overwrite — never dump file body, just confirm.
+        const path = str(args.path);
+        const content = str(args.content);
+        const lines = content ? content.split('\n').length : 0;
+        return {
+          head: basename(path),
+          summary: lines > 0 ? `wrote ${path} · ${lines} lines` : `wrote ${path}`
+        };
+      }
+      case 'edit_file': {
+        // Pull +/- from the diff result if we got one; else fall back
+        // to the edits[] count from args.
+        const path = str(args.path);
+        let added = 0;
+        let removed = 0;
+        for (const line of result.split('\n')) {
+          if (line.startsWith('+') && !line.startsWith('+++')) added++;
+          else if (line.startsWith('-') && !line.startsWith('---')) removed++;
+        }
+        const editsCount = Array.isArray(args.edits) ? args.edits.length : null;
+        const summary =
+          added + removed > 0
+            ? `${path} · +${added} −${removed} lines`
+            : editsCount != null
+              ? `${path} · ${editsCount} edit${editsCount === 1 ? '' : 's'}`
+              : `${path} · edited`;
+        return { head: basename(path), summary };
+      }
+      case 'read_text_file':
+      case 'read_file': {
+        const path = str(args.path);
+        const lines = result.split('\n').length;
+        return { head: basename(path), summary: `${path} · ${lines} lines` };
+      }
+      case 'read_media_file': {
+        const path = str(args.path);
+        return { head: basename(path), summary: `${path} · binary content` };
+      }
+      case 'read_multiple_files': {
+        const paths = Array.isArray(args.paths) ? args.paths.length : 0;
+        return { head: `${paths} files`, summary: `read ${paths} files` };
+      }
+      case 'list_directory':
+      case 'list_directory_with_sizes': {
+        const path = str(args.path);
+        const entries = result.split('\n').filter((l) => l.trim()).length;
+        return { head: basename(path) || '.', summary: `${path || '.'} · ${entries} entries` };
+      }
+      case 'directory_tree': {
+        const path = str(args.path);
+        const lines = result.split('\n').filter((l) => l.trim()).length;
+        return { head: basename(path) || '.', summary: `${path || '.'} · ${lines} entries (tree)` };
+      }
+      case 'search_files': {
+        const pattern = str(args.pattern);
+        const matches = result.split('\n').filter((l) => l.trim()).length;
+        return {
+          head: pattern,
+          summary: matches > 0 ? `${matches} matches` : 'no matches'
+        };
+      }
+      case 'create_directory': {
+        const path = str(args.path);
+        return { head: basename(path), summary: `created ${path}` };
+      }
+      case 'move_file': {
+        const src = str(args.source);
+        const dst = str(args.destination);
+        return {
+          head: `${basename(src)} → ${basename(dst)}`,
+          summary: `${src} → ${dst}`
+        };
+      }
+      case 'get_file_info': {
+        const path = str(args.path);
+        const first = result.split('\n')[0] ?? '';
+        return { head: basename(path), summary: clip(first, 120) };
+      }
+      case 'list_allowed_directories':
+        return { head: '', summary: 'allowed directories listed' };
+      default: {
+        // Unknown tool — show a generic key arg + first line of result.
+        const first = result.split('\n')[0] ?? '';
+        return { head: argLabel(args), summary: clip(first, 120) };
+      }
+    }
+  }
+
+  function argLabel(args: Record<string, unknown>): string {
+    if (typeof args.path === 'string') return basename(args.path);
+    if (typeof args.query === 'string') return args.query;
+    if (typeof args.pattern === 'string') return args.pattern;
+    if (typeof args.source === 'string') return basename(args.source);
+    return '';
+  }
+
+  /** Pretty-print args JSON for the expand panel. Falls back to the
+   *  raw string when args isn't parseable (already-truncated tail). */
+  function prettyArgs(raw: string): string {
+    try {
+      return JSON.stringify(JSON.parse(raw), null, 2);
+    } catch {
+      return raw;
+    }
   }
 </script>
 
@@ -389,19 +494,28 @@
           </div>
           <ul class="mcp-list">
             {#each item.calls as c (c.id)}
-              {@const arg = keyArg(c.tool, c.args_preview)}
-              <li class="mcp-row" class:err={!c.success} title={c.args_preview}>
-                <div class="mcp-line">
-                  <span class="mcp-bullet">●</span>
-                  <span class="mcp-name">{shortTool(c.tool)}</span>
-                  {#if arg}
-                    <span class="mcp-arg">({arg})</span>
-                  {/if}
-                </div>
-                <div class="mcp-line mcp-result-line">
-                  <span class="mcp-elbow">⎿</span>
-                  <span class="mcp-result">{resultSummary(c)}</span>
-                </div>
+              {@const f = formatCall(c)}
+              <li class="mcp-row" class:err={!c.success}>
+                <details class="mcp-detail">
+                  <summary class="mcp-summary">
+                    <span class="mcp-caret">▸</span>
+                    <span class="mcp-line">
+                      <span class="mcp-bullet">●</span>
+                      <span class="mcp-name">{shortTool(c.tool)}</span>
+                      {#if f.head}<span class="mcp-arg">({f.head})</span>{/if}
+                    </span>
+                    <span class="mcp-line mcp-result-line">
+                      <span class="mcp-elbow">⎿</span>
+                      <span class="mcp-result">{f.summary}</span>
+                    </span>
+                  </summary>
+                  <div class="mcp-detail-body">
+                    <div class="mcp-detail-label">args</div>
+                    <pre class="mcp-detail-pre">{prettyArgs(c.args)}</pre>
+                    <div class="mcp-detail-label">result</div>
+                    <pre class="mcp-detail-pre">{c.result || '(empty)'}</pre>
+                  </div>
+                </details>
               </li>
             {/each}
           </ul>
@@ -788,7 +902,38 @@
   }
   .mcp-row {
     padding: 2px 0;
-    cursor: default;
+  }
+  .mcp-detail {
+    display: block;
+  }
+  .mcp-summary {
+    list-style: none;
+    cursor: pointer;
+    display: grid;
+    grid-template-columns: 14px 1fr;
+    column-gap: 4px;
+    row-gap: 0;
+    align-items: start;
+    padding: 2px 4px 2px 0;
+    border-radius: 4px;
+    transition: background 0.1s;
+  }
+  .mcp-summary::-webkit-details-marker {
+    display: none;
+  }
+  .mcp-summary:hover {
+    background: rgba(0, 0, 0, 0.03);
+  }
+  .mcp-caret {
+    grid-row: 1 / span 2;
+    color: #c7c7cc;
+    font-size: 10px;
+    line-height: 1.5;
+    transition: transform 0.15s;
+    user-select: none;
+  }
+  .mcp-detail[open] .mcp-caret {
+    transform: rotate(90deg);
   }
   .mcp-line {
     display: flex;
@@ -798,21 +943,28 @@
     font-size: 12px;
     line-height: 1.5;
     color: #1c1c1e;
+    min-width: 0;
   }
   .mcp-bullet {
     color: var(--accent, #6e6e73);
     font-size: 10px;
     line-height: 1;
     align-self: center;
+    flex-shrink: 0;
   }
   .mcp-row.err .mcp-bullet {
     color: #ff3b30;
   }
   .mcp-name {
     font-weight: 500;
+    flex-shrink: 0;
   }
   .mcp-arg {
     color: #6e6e73;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .mcp-result-line {
     color: #6e6e73;
@@ -821,9 +973,46 @@
   .mcp-elbow {
     color: #c7c7cc;
     margin-right: 2px;
+    flex-shrink: 0;
+  }
+  .mcp-result {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .mcp-row.err .mcp-result {
     color: #ff3b30;
+  }
+  .mcp-detail-body {
+    margin: 4px 0 6px 18px;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.04);
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .mcp-detail-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #8e8e93;
+    font-weight: 600;
+  }
+  .mcp-detail-pre {
+    margin: 0 0 4px 0;
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    color: #1c1c1e;
+    background: rgba(255, 255, 255, 0.6);
+    padding: 6px 8px;
+    border-radius: 4px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 320px;
+    overflow: auto;
   }
   .decisions {
     margin: 4px 0 0 0;
@@ -946,6 +1135,22 @@
     }
     .mcp-row.err .mcp-result {
       color: #ff6961;
+    }
+    .mcp-summary:hover {
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .mcp-detail-body {
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .mcp-detail-pre {
+      background: rgba(0, 0, 0, 0.3);
+      color: #f5f5f7;
+    }
+    .mcp-detail-label {
+      color: #98989d;
+    }
+    .mcp-caret {
+      color: #48484a;
     }
     .topic-title {
       color: #f5f5f7;

@@ -5,7 +5,7 @@
 //! adds a parallel persistence path so the call log survives restart the
 //! same way `messages.jsonl` does.
 //!
-//! Architecture: a single writer task per session reads `McpCallEvent`s
+//! Architecture: a single writer task per session reads `ToolCallEvent`s
 //! off an mpsc channel and appends each as JSONL. Every agent runtime
 //! holds a clone of the channel sender (cheap, `mpsc::Sender` is Clone)
 //! and records every call there, in addition to the Tauri event emit
@@ -25,7 +25,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::agent::mcp::McpCallEvent;
+use crate::agent::mcp::ToolCallEvent;
 
 const CHANNEL_CAPACITY: usize = 256;
 pub const MCP_LOG_FILE: &str = "mcp_calls.jsonl";
@@ -34,7 +34,7 @@ pub const MCP_LOG_FILE: &str = "mcp_calls.jsonl";
 /// just an `mpsc::Sender`.
 #[derive(Clone)]
 pub struct McpLogHandle {
-    tx: mpsc::Sender<McpCallEvent>,
+    tx: mpsc::Sender<ToolCallEvent>,
 }
 
 impl McpLogHandle {
@@ -42,7 +42,7 @@ impl McpLogHandle {
     /// is full, in which case it yields. Send failure is logged but
     /// otherwise swallowed — we never want a disk hiccup to wedge an
     /// agent task.
-    pub async fn record(&self, event: McpCallEvent) {
+    pub async fn record(&self, event: ToolCallEvent) {
         if let Err(e) = self.tx.send(event).await {
             tracing::error!(
                 target: "aidock::mcp_log",
@@ -66,7 +66,7 @@ pub async fn spawn_writer(path: PathBuf) -> std::io::Result<(McpLogHandle, JoinH
         .open(&path)
         .await?;
 
-    let (tx, mut rx) = mpsc::channel::<McpCallEvent>(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<ToolCallEvent>(CHANNEL_CAPACITY);
     let task = tokio::spawn(async move {
         tracing::info!(
             target: "aidock::mcp_log",
@@ -106,7 +106,7 @@ pub async fn spawn_writer(path: PathBuf) -> std::io::Result<(McpLogHandle, JoinH
 /// Read every parseable line of an MCP-call JSONL file. Matches the
 /// behaviour of `persistence::read_jsonl_messages` — malformed tail-lines
 /// are skipped with a warning so a crash never blocks reload.
-pub fn read_mcp_calls(path: &std::path::Path) -> std::io::Result<Vec<McpCallEvent>> {
+pub fn read_mcp_calls(path: &std::path::Path) -> std::io::Result<Vec<ToolCallEvent>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -118,7 +118,7 @@ pub fn read_mcp_calls(path: &std::path::Path) -> std::io::Result<Vec<McpCallEven
         if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<McpCallEvent>(line) {
+        match serde_json::from_str::<ToolCallEvent>(line) {
             Ok(e) => out.push(e),
             Err(e) => {
                 bad += 1;

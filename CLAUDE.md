@@ -17,7 +17,7 @@ explicitly; usually the right answer is to fix the contract between them
 - **Rule**: read-only consumer of events from block ②. Never reach past ② to change backend behavior.
 
 ## ② IPC 契约
-- **Files**: `src/lib/ipc.ts` ↔ `src-tauri/src/commands.rs`, Tauri event names/payloads (`MESSAGE_EVENT`, `MCP_CALL_EVENT`, `APPROVAL_REQUEST_EVENT`)
+- **Files**: `src/lib/ipc.ts` ↔ `src-tauri/src/commands.rs`, Tauri event names/payloads (`MESSAGE_EVENT`, `TOOL_CALL_EVENT`〔原 `MCP_CALL_EVENT`；step 5 泛化成所有 Call 工具〕, `APPROVAL_REQUEST_EVENT`)
 - **Owns**: command names, payload schemas, the wire types between front and back
 - **The narrow waist**: this is the *only* surface that crosses ① ↔ ③/④. Changing a schema here means both sides must update in lockstep.
 
@@ -31,13 +31,90 @@ explicitly; usually the right answer is to fix the contract between them
 - **Owns**: identity & system prompt, tool catalog, memory, LLM context assembly, approval gating, **the per-turn reasoning loop**
 - **Does NOT own**: cross-agent protocol (lives in ③), UI rendering (lives in ①)
 
+### 角色能力 = 三层防御（缺一不可）
+
+一个角色"能干什么/不能干什么"靠**三层叠加**约束，不是单点。**身份自觉单独用不可靠**（dev-test 2026-06-02 证伪：PM 被要求"别写代码"却自己写了 todo.py）。
+
+1. **提示层（身份）**：system_prompt 把角色说清楚——是什么、能干什么、**绝不能干什么**。让 agent "懂"边界。要求身份**稳在上下文里、不被历史污染**（system prompt 永远在 context 最前；④.b 压缩记忆 + 会话边界帮它不被旧消息带歪）。
+2. **工具门控层（结构）**：身份不算数时，**结构上够不着**。`RoleConfig.mcp_access`（None/ReadOnly/All）在 `build_all_tools` 里 BEFORE-advertise 过滤——模型看不到的工具就调不了。例：PM = `ReadOnly`，写/改/删工具从不进它的工具表，**物理上没法写代码**。
+3. **不可违背的硬约束层（工作区间 confinement）**：无论怎么命令都**物理做不到**。进工作室时选定一个**可信工作区间**；改/删类工具的目标路径经 `canonicalize`（解 `..` + 软链）后必须落在区间内，否则拒（详见 ④.d 安全检查的 L3 红线）。对**结构化文件工具**（Edit/Write/删除）这是铁的——路径是参数，校验跑不掉；对 **Bash** 是尽力而为（命令串无法静态判定，靠安全级别/规则把关）。**这层 prompt 改不动**——这正是"我让它删系统文件它哪天真删了"这类担忧的最终答案。
+> **重大转向（2026-06-03）**：原"OS 沙箱（Seatbelt/ASRT）"方案**整个废弃**。本地桌面、用户在场、威胁是"agent 犯错"而非"恶意攻击"，可信工作区间 + 路径校验即足够，且对齐 CC 默认（CC 默认不开 OS 沙箱，底线靠权限系统）。详见 ④.d。
+
+> 推论：危险/不可逆能力（写盘、shell、删除）的开放，必须同时过 2、3 层，不能只靠第 1 层。
+
+### ④ 工具调用系统（统一注册表）—— 2026-06-03 重定义
+
+> **重定义**：原"MCP 文件服务器（`fs__*`）+ `shell`"换成 **CC 对齐的原生工具族 + MCP 降级为普通工具来源**。
+> **现状**：✅ **step 1**（`agent/tools.rs`：`ToolSpec`/`Handling`/`Backend`/`SecurityLevel` + `static_registry`/`mcp_specs`/`advertised_tools`；`RoleConfig` 拆 `tools`(逐名目录)+`security_level`，`mcp_access` 删；`runtime::build_all_tools` 退役）。✅ **step 2**（`agent/fs_tools.rs`：原生 Read/Edit/Write/Glob/Grep，`Backend::Native`，经 `CompositeExecutor` 路由；read-before-edit 读状态；改/删经 `mutation_in_workspace` 锁工作区间 L3；过渡 token 已删，目录改逐名；MCP 走 `advertised_tools` 统一逐名）。✅ **step 3**（`agent/shell.rs` 重写：`shell`→`Bash`，**去 OS 沙箱**——`Seatbelt/AsrtSandbox` 删，`tokio::process` 直跑 cwd=工作区间；前台超时 + 输出超量落盘只回预览+路径；后台三件套 `Bash(run_in_background)`/`BashOutput`/`KillShell` + per-agent 进程登记表 `BashRegistry`；engineer 目录 + system prompt 同步）。✅ **step 4**（`agent/security.rs`：危险分级 L0-L3 + `decide`；`CompositeExecutor::execute` 在文件改/删 + Bash 前过安全检查——L3 拒、L2/严格-L1 复用 `APPROVAL_REQUEST_EVENT` 问人、否则放行；Bash 真空窗关闭）。✅ **step 5**（事件泛化：`McpCallEvent`→`ToolCallEvent`、`MCP_CALL_EVENT`→`TOOL_CALL_EVENT`(值 `aidock:tool_call`)，前后端锁步；`McpExecutor::emit` + `CompositeExecutor` 给**每个原生 Call 工具**发统一事件 → UI 现在能看到文件/Bash/recall 调用卡，不再只有 MCP；被拒的尝试也发卡）。✅ **MCP 审批收口**（`McpExecutor` 退成 `call_backend`——纯后端调用、无审批无事件；`mcp__`/`fs__` 经 `is_mcp_tool` 走 `CompositeExecutor` 的**同一道**安全检查 L2→问人 + 同一处 emit。`McpExecutor::execute` 仅余其单测用）。✅ **清理空转 fs__ 服务器**（`session.rs` 不再 `spawn` `@modelcontextprotocol/server-filesystem`；`mcp = None`，MCP 管道保留给将来用户自配 `mcp__` 服务器）。✅ **specifier 规则**（`PermissionRule` + `match_rules`，挂 `RoleConfig.permission_rules`；默认拒读密钥 + 工程师验证命令免问 + 危险硬拒）。⬜ 待做：前端 `McpCallEvent` 接口名 + `load_mcp_call_history`/`mcp_calls.jsonl` 内部名（纯命名）、LSP（独立立项）。
+
+**统一前门、差异化后端**：模型只看见**一张扁平工具目录**、自己挑；"协议 / 记忆 / 外部"的区别是"被挑中后怎么处置"的后端差异，**不泄到门面**。一个 **`ToolSpec` 注册表**，每个能力一处声明：
+```
+ToolSpec { name, description, schema, handling }
+enum Handling {
+    Call { backend, danger },    // 唯一过安全检查(④.d) + 执行器的一类
+    Plan, Message, Suspend, End  // 控制类，循环内联，不碰安全检查
+}
+enum Backend { Native(Rust), Mcp(server), Internal }
+```
+`handling` 这一格 = 之前散在 `llm_source::translate` + `CompositeExecutor` if-else 的硬编码，归位成数据。**推论：只有 Call 类才可能危险**——write_todos/DONE/ASK 等控制类天然到不了安全检查，安全机器永远只裹 Call 族。
+
+**效果类别 → 成员**：
+
+| Handling | 成员 | 处置 |
+|---|---|---|
+| Call | Read/Edit/Write/Glob/Grep/Bash/LSP、mem_recall、topic_recall/topic_browse、`mcp__*` | 过安全检查(④.d) + 执行器，结果双通道回灌 |
+| Plan | write_todos | 改 `TurnState.plan` |
+| Message | BROADCAST/ANSWER/WORK_START/PROGRESS/SUMMARY | 翻成 ③ 消息 |
+| Suspend | ASK_AGENT | 挂起转 WAITING_ANSWER |
+| End | DONE | 收尾 |
+
+**工具改名 + 前缀即命名空间**（模型扫前缀就知道碰哪一层）：
+
+| 新名 | 旧名 | 前缀/族 |
+|---|---|---|
+| `write_todos` | set_plan | 控制（无前缀） |
+| `mem_recall` | recall_detail | `mem_` = ④.b 私域记忆 |
+| `topic_recall` | recall_topic | `topic_` = ③ 协作历史（整段拉全） |
+| `topic_browse` | search_topic | `topic_` = ③ 协作历史（带 query 过滤） |
+| `mcp__server__tool` | `fs__*`（MCP 文件服务器） | MCP 不再特殊，同走权限/事件/双通道 |
+
+> 原生工具用 CC 的 PascalCase 名（Read/Edit/Bash…），原生内部用 snake_case + 族前缀。`fs__` 双下划线是 MCP 强加的；原生工具单下划线。
+
+**外部工具族（CC 对齐，原生 Rust）**：
+- **Read / Glob / Grep** — 只读，可越界（L0）；Read 带行号、大文件 offset/limit，读成功登记 `read_files`（喂 read-before-edit）。
+- **Edit** — `old_string → new_string` 精确替换 + **read-before-edit**（没读过/已变更则拒）；old 找不到/不唯一报错。
+- **Write** — 覆盖**已存在**文件要先 Read（防盲覆盖），新文件免；**自动 `create_dir_all` 父目录**。
+- **Bash** — **无沙箱**，`tokio::process`，cwd=workspace；超时（默认 120s/上限 600s）；**输出截断落盘**（全量→⑥、预览+路径→LLM，双通道）；后台三件套 `run_in_background` + `BashOutput` + `KillShell` + 进程登记表（对齐 CC）。
+- **LSP** — 见下（路2 自管轻 manager）。
+
+**LSP（路2：自管轻 manager，不照搬 CC）**：CC 的 LSP 要么白嫖宿主 IDE 的语言服务器、要么 opt-in 插件自管；AiDock 无宿主 IDE，路子 = **一次性写通用 LSP 客户端**（`lsp-types` + stdio JSON-RPC，非从零造协议）接**用户机器装的**语言服务器，**语言→server 做成配置驱动**（社区可扩 = 你们版"插件市场"）。
+- 服务器映射：rust-analyzer / pyright / gopls / clangd（C+C++）/ jdtls（Java，重）/ omnisharp（C#）/ **volar（Vue）** / **typescript-language-server（含 React、Electron——它俩不是语言，就是 JS/TS）**。
+- **降级链**：装了→启它管它；没装→grep / tree-sitter 顶 + **提醒用户装**（走 ②）。诊断另走 Bash 跑 `cargo check`/`tsc`/`pyright`（一次性、不用常驻 manager）。
+- 客户端写一次，加语言 = 加配置行（+ per-server 怪癖长尾）。先接 Rust/TS/Python/Go，其余按需。
+- **MVP 细化**：先用 `serde_json::Value` 直接拼/读协议、暂不引 `lsp-types`（4 操作形状简单、省重依赖）；server 池**会话级共享**（rust-analyzer 启动要索引整个工程，必须长驻跨 agent/回合复用，类比 `McpClient`）；文档同步先 didOpen-on-query；v1 操作 = definition / references / diagnostics / hover；诊断无 server 时回落 Bash 检查器。
+
+##### LSP 实施进度（分阶段）
+- ✅ **P0**：`lsp.rs` 工具定义（`LSP{operation,file_path,line?,character?}`，L0）+ 执行器路由；占位回落"用 Grep / 跑 cargo check"引导；**暂不进角色目录**（P4 接线后加入工程师）。
+- ✅ **P2**：`lsp_client.rs` 客户端内核——Content-Length 分帧 + 请求↔响应关联 + 通知(publishDiagnostics)收集 + 服务器反向请求回 null。泛型于 reader/writer，**`tokio::io::duplex` 假服务器全测**（不依赖装 rust-analyzer）。
+- ✅ **P3**：`lsp_pool.rs` 会话级 `LspPool`——`ServerSpec` + `server_for_path`(rust-analyzer/ts-language-server/pyright/gopls，.ts/.js 共用一个)+ `binary_on_path` PATH 探测 + `path_to_uri` + 懒启动(start_lock 防并发双启)+ initialize/initialized 握手 + `kill_on_drop` 生命周期。配置/探测/uri/缺二进制→装提示 全单测；真 spawn 段靠 dev 机 smoke。
+- ✅ **P4**：`lsp.rs` 4 操作接进 `LSP` 工具——`execute_lsp(pool,args)`：`server_for_path`→**参数校验(位置 fail-fast，起 server 前)**→`get_or_start`→didOpen→请求→`format_locations/hover/diagnostics`(响应→`path:line:col`+片段，1-based↔0-based 转换；诊断 didOpen 后轮询 publishDiagnostics)。`LspPool` 经 `session→AgentBoot→runtime→CompositeExecutor` 注入(会话级共享)；`LSP` 进工程师目录(此时才广告)。纯格式化 + run_operation(duplex 假 client) 全测。
+- ✅ **P5**：降级——未配语言 / server 没装 → `degraded()` 回落"Grep 导航 + `cargo check`/`tsc`/`pyright` via Bash + 装 server"引导（`success:true` 信息态、不触发 backstop；经统一 `TOOL_CALL_EVENT` 也到 UI，省了单独的 ② 装提示事件）。
+- ✅ **dev-smoke 已验通**（`examples/lsp_smoke.rs`，`cargo run --example lsp_smoke`，需 `rustup component add rust-analyzer`）：对真 rust-analyzer 端到端 4 操作全绿——definition→`lib.rs:1:8`、references→两处调用+声明、hover→`pub fn greet(name:&str)->String`、diagnostics→`expected u8, found String`。**smoke 逮到并修了 3 个真 bug**：① server 退出时请求干等 30s → reader 收 EOF 清空 `pending` 秒回（`request_fails_fast_when_server_disconnects` 守）；② 查询早于索引完成返回空 → opt-in `experimental/serverStatus`，池握手后 `wait_until_ready` 再交出 client；③ rootUri 未 canonicalize 而文件 uri canonicalize（macOS /tmp↔/private/tmp）→ server 认文件不属工程返回空 → `LspPool::new` 统一 canonicalize 工作区。
+- ⬜ **P6（延后）**：改完文件自动诊断、全量 didChange、tree-sitter 导航中间档、更多语言、initialize 握手 dev 验/加固。
+
+**`RoleConfig` 拆字段**（`mcp_access` 揉了"目录"和"只读"两件事，拆开）：`tools: Vec<String>`（目录，**逐名**）+ `security_level`（严格/标准/宽松，见 ④.d）。`build_all_tools` 退化成 `registry().filter(|t| role.tools.contains(t.name))`。PM 的"只读"本质由**目录**决定（够不着写工具），不是安全级别。
+
+**注册表落盘**：`agent/tools/` 一工具一文件、自带 `ToolSpec`；`registry()` 启动收齐。终结"加一个工具改 5 处"。
+
+**② 契约变动**：`MCP_CALL_EVENT` 泛化成通用 `TOOL_CALL_EVENT`（"MCP 不特殊"的必然）；① 渲染从"MCP 调用卡"泛化成"工具调用卡"。双通道规则不变（全量→⑥/UI、摘要→LLM）。①/② 锁步改。
+
 ### ④ 子模块拆分
 
 V0.1 把整个 ④ 当成一个"reflex"实现：一条入消息 → 一次 LLM call → 一个出动作。下个阶段把它拆成四个**可独立设计的子模块**。任何 ④ 的改动都该明确说自己改的是哪个子模块；跨子模块的改动要先调它们之间的接口、再分别改。
 
 #### ④.a ReAct 计划循环
 - **管**: 单 agent 一回合的内部状态机，把"接消息 → 直接出动作"改成"plan → act → 观察 → 必要时再 plan → ..."
-- **不管**: 上下文是哪里来的（④.b 管）、动作的结果是否符合预期（④.c 管）、不可逆操作的预演（④.d 管）
+- **不管**: 上下文是哪里来的（④.b 管）、动作的结果是否符合预期（④.c 管）、危险动作的安全校验（④.d 管）
 - **接口**:
   - 入：incoming `AgentMessage` + ④.b 给的 context bundle
   - 出：next action（发消息 / 调工具 / 等待 / 结束回合），可循环
@@ -93,7 +170,7 @@ V0.1 把整个 ④ 当成一个"reflex"实现：一条入消息 → 一次 LLM c
 现在不实现 ④.c/④.d，但 ④.a 地基必须先留好它们的"插座"，否则以后是刨地基重铺。三个插座：
 
 - **④.c 插座（结果校验）**：循环里"拿到结果"和"据此继续"之间，**永远**过一道 `判断(结果) → 信号(continue/retry/escalate/abort)` 关卡。MVP 这关卡是**桩**、恒返回 `continue`；④.c 上线 = 换掉桩。**循环分叉只认信号、不直接看原始结果**——这样加 ④.c 不动骨架。
-- **④.d 插座（沙箱）**：动作不许直接调工具，必须过一个**唯一执行口子** `执行(动作)`。MVP = 直接真调；④.d = 口子里先 dry-run/temp、验过再 commit。注意沙箱 ≠ 审批门（审批=问人，沙箱=agent 自验），两条独立通道可同时裹在这口子上。
+- **④.d 插座（安全检查）**：动作不许直接调工具，必须过一个**唯一执行口子** `执行(动作)`。MVP = 直接真调；④.d = 口子前先过安全检查关卡（危险分级 → 安全级别 → 放行/问人/拒，L3 越界永拒）。注意安全检查 ≠ 审批门：界内直接跑，只在 L1/L2 按角色安全级别才"问人"（问人复用审批通道）。〔原"沙箱/dry-run"设计已废，见 ④.d〕
 - **④.a「等待」↔ ③ 接口**：见下方硬约束。
 
 ##### 硬约束：Turn 可暂停 + Plan 可存取（等待动作走挂起-恢复）
@@ -170,8 +247,23 @@ loop {
 - **接口**:
   - 入：incoming message、tool result、agent 自己产生的输出
   - 出：context bundle（给 ④.a 当一次 plan 的上下文）
-- **现状**: 临时桩。scratchpad/{role}.json + 闭合 topic 索引 + `recall_topic` 工具混在一起，没分层、没裁剪策略
+- **现状**: 临时桩（`build_level_0_context` + scratchpad + `recall_topic`），没分层、没裁剪策略。**设计已冻结**（见下"本轮敲定"），未实现。
 - **持久化承担方**: ⑥ 负责落盘，④.b 负责"层级语义"
+
+##### 本轮敲定（混合分工 + 计划驱动 + 自报家门）—— 设计冻结，未实现
+
+**1. 分工（谁读谁写）**：
+- **程序（Rust）**：组装 context bundle 喂 ④.a（确定性、不烧 token）；在 `ActionExecutor` 口子上捕获 L3（每次 `fs__` 写成功后 git commit 到 `.aidock_git`）。
+- **守护归纳 agent（LLM）**：把详情压成小结 / L2 打包。**缩水**——结构不靠它重建（见 2）；**MVP 可先不上**，结构+详情裸存先跑通。
+- **主 agent**：只管干活 + 按需 `recall_detail(id)` 拉详情，不再手动记账（→ 现有 `scratchpad` 退役、`recall_topic` 演进成 `recall_detail`）。
+
+**2. 结构跟着计划走（关键——接上 ④.a 的 `set_plan`）**：记忆结构不是事后扒流水账重建，而是 agent 规划时**实时、免费**长出来的：
+- `set_plan` 的**目标** → **大主题**；每一**步** → **小主题**；每步实际干的（代码/决策/坑）→ **详情**；步骤标"完成"→ 小主题闭合。
+- 推论：**大主题文件 ≈ 持久化的 Plan**（④.a 的 `TurnState.plan` 正好落成它）。
+
+**3. context bundle（开始干活时给 agent 看啥）**：默认 = **当前大主题计划表（目标+各步状态）** + **当前步详情全文** + **已完成步的一句话小结**；其余大主题不看。
+
+**4. 摘要必须"自报家门"（防 LLM 把精简版当全部）**：每条折叠笔记眼前必带 **小结 + id + `recall_detail(id)` 取回指针**；上下文放常驻提示"带 📎 的有全文"；**计划表永远列全步骤**（只折叠 done 步正文）。否则 recall 工具形同虚设——LLM 不知道自己不知道。与现有"MCP 结果摘要后跟 `[已截断,全文在日志]`"一脉相承。
 
 ##### 三层结构（按"粒度 / 保留时长"切）
 
@@ -190,25 +282,30 @@ loop {
 
 ##### 归纳谁来做
 
-**"守护归纳 agent"**——挂载在主 agent 任务上的内部 agent（非用户可见角色，不是 PM / 前端 / 后端），专门把 L3 详情往 L1 三粒度灌。归纳是 ④.b 架构里**固有的一环**，不是可选项。
+**"守护归纳 agent"**——挂载在主 agent 任务上的内部 agent（非用户可见角色，不是 PM / 前端 / 后端）。**本轮缩水**（见"本轮敲定"1）：结构由 `set_plan` 实时给出、不靠它重建；它只负责把详情压成小结 + L2 打包，**MVP 可先不上**。触发时机：**实质回合**（写了文件/改了方案）结束后才跑，跳过纯一句话的小回合。
 
-##### L1 三粒度存储方案：分层文件系统
+##### L1 存储方案：套文件夹（保结构）+ 内容混淆（A 档 — 防剖方案）
+
+保留嵌套结构（目录层级 = 大→小→详情），但**为防开发剖存储方案做两件事**：
+1. **文件/文件夹名去语义**——只留序号，不带目标/步骤 slug（否则目标与步骤名直接摆在文件名里，内容混淆也白搭）。
+2. **内容存成自定义混淆块**——Rust 在读写边界 encode/decode，`cat` 出来是乱码。
 
 ```
-~/.aidock/sessions/default/agents/{agent_id}/memory/
-  topics/
-    topic-001-login.md      # 大主题：标题、状态、小主题清单（链接）
-    topic-002-cart.md
-  subtopics/
-    sub-001-tech-doc.md     # 小主题：标题、归属大主题、简介、详情链接
-    sub-002-jwt.md
-  details/
-    detail-001-tech-doc.md  # 详情：完整内容
+~/.aidock/sessions/{session}/agents/{agent_id}/memory/
+  topic-001/        # 大主题（序号即 id，无语义 slug）
+    _topic          # 混淆块；解开后 = markdown(目标+步骤+状态, ≈ 持久化 Plan)
+    01/             # 小主题（序号）
+      detail        # 混淆块；解开后 = markdown(小结行 + 正文)
+    02/
+      detail
+  topic-002/
+    _topic
 ```
 
-文件格式：**markdown + YAML frontmatter**（`id` / `parent` / `status` / `created_at` / `updated_at`）。
-
-**为什么选这个**（vs 嵌套 JSON / SQLite / 事件流）：LLM 用现成的 `fs__read_file` / `fs__write_file` 工具直接操作；每文件大小可控；git tracking 天然；跟人类项目笔记直觉一致。
+- **逻辑格式仍是 markdown**（解开后），给 LLM / 我们的代码用；**物理落盘是混淆块**。LLM 全程走 Rust（bundle / recall_detail），永远看明文、不碰原始文件。
+- **混淆 ≠ 加密**：减速带不是墙（解码逻辑在二进制里，铁心开发反编译照样拿到）。**不上带本地钥匙的加密**（假安全）。`encode`/`decode` 可换可升级（MVP = dep-free keystream XOR + magic header）。
+- **接受的代价**：① git L3 的"可读 diff + delta 压缩"失效（落盘是混淆块）——回滚(reset)仍可用，"看变化"+压缩没了；② 目录树形仍泄露"有个 3 层层级"这一点（A 档接受的泄露），但目标/步骤/详情这些**语义**藏住了；③ 人没法肉眼看记忆。
+- 原"fs 工具友好 / 人类可读"理由作废（分工下 LLM 本就不碰原始文件，记忆由 Rust 管）。
 
 ##### 已知弱点 / 后续加固 backlog（不阻塞 MVP）
 
@@ -220,61 +317,56 @@ loop {
 
 #### ④.c 结果校验 / 反馈回路
 - **管**: ④.a 执行完一个 action 后，agent 自己评估"这一步真的推进了 plan 吗？"，决定 continue / retry / escalate / abort
-- **不管**: action 本身怎么执行（④.a），不管沙箱（④.d）
+- **不管**: action 本身怎么执行（④.a），不管安全检查（④.d）
 - **接口**:
   - 入：④.a 的当前 plan + 刚执行的 action + result
   - 出：信号 `continue | retry | escalate | abort` 给 ④.a
 - **现状**: 没有。工具调用返回什么 agent 就吞什么，不会发现"咦这和我预期不一样"
 
-#### ④.d 沙箱
-- **管**: 不可逆工具调用前的预演 / 临时副本。让 agent 自己先验一遍再 commit
-- **不管**: 决策为何选这个工具（④.a + ④.c 管）、用户是否批准（已有 approval gate）
-- **接口**:
-  - 入：要执行的工具调用
-  - 出：routing through dry-run / temp 目录；最终 commit 或 rollback
-- **现状**: 没有。approval gate 只是问用户"能不能干"，干就直接动真盘
-- **与 approval 的区别**: approval gate 是"问人"，沙箱是"agent 自己先验"。两条独立通道
+#### ④.d 安全检查（工作区间 confinement + 危险分级 + 安全级别）
 
-> **shell / 命令执行能力 = ④.d 的硬前置，不得提前放出。** dev-test 时用户提出"让 agent 跑 `npm run dev` 启动项目"。结论：**推迟到 ④.d**。理由：shell 是地基阶段最危险的不可逆能力，只靠 approval gate（问人）远远不够。而且它需要的沙箱**比本节原设想的"temp 副本 / dry-run"更强**——那针对文件操作；任意进程要的是 **OS 级隔离**（容器 / `sandbox-exec` / chroot+seccomp / 资源限制 / 断网），挡住 `rm -rf /`、外联、挖矿。设计要点：① 工具 `shell__run(command, background?)`，一次性等结果 / 长驻后台 spawn+登记 PID ② 路由进 `CompositeExecutor`（新 `ShellExecutor` 分支，原生 `tokio::process`，不走 MCP）③ `classify()` 标 Destructive，过审批门 ④ 仅工程师角色，PM 无 ⑤ 跑在 OS 沙箱内。在 ④.d OS 沙箱就绪前，agent 只写文件 + 把启动命令告诉用户，由用户手动跑。
+> **重大转向（2026-06-03）**：原"OS 沙箱（dry-run / temp 副本 / Seatbelt / ASRT）"方案**整个废弃**，`agent/shell.rs` 的 `SeatbeltSandbox` / `AsrtSandbox` 作废待删。改为**工程化的"安全检查"防线**——可信工作区间 + 路径校验 + 角色安全级别。理由：本地桌面、用户在场、威胁模型是"agent 犯错"而非"恶意攻击"，且对齐 CC 默认（CC 不开 OS 沙箱，底线靠权限系统）。
 
-##### 设计基线（对标 Claude Code 的沙箱，2026-06 查证）
+- **管**: 每个 **Call 类**工具执行**前**的一道关卡（= CC 的 PreToolUse 位置）。两步——先算**客观危险级**，再按**角色安全级别**决定 放行 / 问人 / 拒。
+- **不管**: 决策为何选这工具（④.a/④.c）、工具怎么执行（backend）。
 
-CC 的沙箱不是容器/VM，是 **OS 原语**：**macOS = Seatbelt（`sandbox-exec`/SBPL）**，**Linux/WSL2 = bubblewrap + namespaces + seccomp**。Anthropic 把它开源成 npm 包 **`@anthropic-ai/sandbox-runtime`**（包住一个进程 + 网络代理 + 可选 seccomp）。对 AiDock 这种本地桌面工具，OS 原语优于容器（不依赖 Docker、启动快、无小白门槛）；容器/远程沙箱留作"更强更重"的产品级选项。
+**① 客观危险分级（引擎算，不可配）** —— 每次 `(工具, 参数)` 算一个 `Level`：
 
-落到我们架构的 5 条基线：
-1. **机制**：OS 原语（mac Seatbelt / Linux bwrap+seccomp）。优先评估直接 *adopt* `@anthropic-ai/sandbox-runtime` 而非从零造（AiDock 已在用 npx 跑 Node 子进程，接得上）。
-2. **挂载点**：④.a 的 `ActionExecutor::execute()` **唯一执行口子**——"开沙箱"=工具在盒子里跑，`CompositeExecutor` 路由一行不改，只换执行后端。
-3. **文件**：写限 workspace；读默认宽——但**必须默认 `denyRead` `~/.ssh`、`~/.aws/credentials` 等敏感路径**（CC 默认不挡，这是它的坑，别抄）。
-4. **网络**：deny-by-default + 主机名白名单代理（代理在盒**外**，不解 TLS → 宽白名单有 domain-fronting 风险）。dev 刚需域（npm/pypi/cargo registry 等）进默认白名单，否则 `npm install` 直接挂。
-5. **沙箱 × 审批关系（修正旧"两条独立通道"说法）**：**沙箱是强制底线，审批只在"越界"（写出界 / 连新域名）时才触发**。界内操作直接跑、不烦用户——顺带治掉"每个写文件都要点批准"的痛（dev-test 实测的痛点）。
-
-##### 施工方案（混合，分阶段）—— 已定，实现排在 ④.b/④.c 之后
-
-**ASRT 评估结论（spike 2026-06）**：`@anthropic-ai/sandbox-runtime`（`srt` CLI，Apache-2.0，v0.0.52，实验性 0.0.x）—— ✅ 有限命令完美（自带 Seatbelt + 网络白名单代理，JSON 配 `denyRead/allowWrite/allowedDomains`）；❌ **长驻 dev server 不支持**（`allowLocalBinding` 默认关、端口宿主可达性无文档、代理生命周期绑被包进程、无 daemon）。Node 依赖对 AiDock 是 free（已靠 npx 跑 MCP）。
-
-**所以劈成两半（都走 `ShellExecutor` → ④.a `execute()` 口子，`classify()` 标 Destructive 过审批，仅工程师角色）**：
-
-| 用途 | 选型 | 理由 |
+| 级 | 是什么 | 例 |
 |---|---|---|
-| 有限命令（install/build/test/lint） | **adopt ASRT**（`srt --settings x.json <cmd>`） | 出站网络白名单是难点，ASRT 白送 |
-| 长驻 dev server（npm run dev） | **自建 Seatbelt 包装**（Rust shell→`sandbox-exec` + 自定义 profile） | ASRT 搞不定；自定义 profile 允许绑端口 + detached spawn + 进程登记表（列/杀），宿主浏览器直访 localhost:port |
+| **L0 无害** | 只读 + 一切内部操作 | Read/Glob/Grep/LSP（可越界）、mem_recall、topic_*、write_todos、消息工具 |
+| **L1 区内改** | 改/删，路径**在**工作区间 | Edit/Write/删除 → 区内 |
+| **L2 需确认** | 影响无法静态判定 | Bash、`mcp__*`、装依赖/联网 |
+| **L3 禁止** | 改/删，路径**越界** | Edit/Write/删除 → 区外（**永拒，任何安全级别都不能放行**） |
 
-**分阶段**：
-- **P0 spike**：✅ ASRT 调研完；剩 PoC——验证自建 Seatbelt profile 能否让宿主访问 dev server 端口（~半天）。
-- **P1 有限命令沙箱（MVP）**：`shell__run(command)`→ASRT；workspace 写限制 + `denyRead ~/.ssh ~/.aws` + dev registry 白名单；接 CompositeExecutor + 审批 + 工程师专属；`Sandbox` trait 做成可 fake 接缝，测试驱动。
-- **P2 长驻服务**：`shell__serve`/background → 自建 Seatbelt + 进程登记表 + 端口暴露（解"看界面"）。
-- **P3 加固/跨平台**：Linux bwrap、沙箱=底线/审批=越界才触发的 UX、资源限制。
+L3 红线的物理实现 = `level_for_path`：路径相对 workspace 解析 → `canonicalize`（解 `..` + 软链；不存在的新文件则**探父目录**）→ 是否 `starts_with` canonicalize 过的 workspace。**对结构化工具是铁的**（路径是参数）；**对 Bash 是尽力而为**（恒 L2，命令串无法静态判越界，靠规则/问人兜）。
+
+**② 安全级别（可配，挂 `RoleConfig`，角色级）** —— 只挪 L1/L2 的"放行↔问人"，**碰不到 L3**：
+
+| 安全级别 | L0 | L1 区内改 | L2 需确认 | L3 越界 |
+|---|---|---|---|---|
+| **严格** | 放行 | 问人 | 问人 | 拒 |
+| **标准**（默认） | 放行 | 放行 | 问人 | 拒 |
+| **宽松** | 放行 | 放行 | 放行 | 拒 |
+
+"问人"复用 `APPROVAL_REQUEST_EVENT`(②)。比 CC 更紧：CC 的 `bypassPermissions` 连越界都放，AiDock 的 L3 永不松。
+
+- **谁是哪一层**：工作区间 = 会话/工作室级（进工作室选，全员共享一条边界）；L3 红线 = 全局不变量；安全级别 = **角色级**（④ 内部架构）。边界共享、strictness 各角色各拧、红线谁都松不动。
+- **specifier 规则**（`Bash(npm test)` 放行 / `Bash(rm *)` 拒）= 级别→策略**之前**的一道短路，**不在 `danger` 里**（danger 只算客观级）。
+- **现状**: ✅ **已落地**（`agent/security.rs`：`Level`(L0-L3) + `classify_level(tool,args,ctx)` + `decide(level,security_level)`；`CompositeExecutor::execute` 在文件改/删 + Bash 前过这道关——Deny 直接 `DENIED`、Ask 复用 `McpExecutor::approve`→`APPROVAL_REQUEST_EVENT`、Allow 放行；L3 物理底线另由 `fs_tools::within_workspace` 在文件工具处再兜一层）。注：设计里 `Handling::Call.danger` 落地成集中函数 `classify_level`，不是每 spec 一个 fn 指针。✅ MCP 已收口进本道（`is_mcp_tool` → L2 → 同一道问人；`McpExecutor` 退成纯后端 `call_backend`）。✅ **specifier 规则**（`security.rs`：`PermissionRule{tool,pattern,action}` + `match_rules`，级别策略**之前**短路——Deny 优先、Allow 免问；挂 `RoleConfig.permission_rules`。默认：所有角色拒读密钥 `Read(*/.ssh/*)`，工程师常用验证命令免问 + `sudo`/`rm -rf /` 硬拒。Bash 命令串匹配 best-effort 可绕，非墙）。
+
+> **历史（已废弃，留作脉络）**：本节曾基于"OS 沙箱"设计——`shell.rs` 里实测落地过 `SeatbeltSandbox`（`sandbox-exec` + 自写 profile）和 `AsrtSandbox`（`@anthropic-ai/sandbox-runtime`），shell 工具走 `CompositeExecutor`、工程师专属、前台命令能在盒里真跑。**2026-06-03 整体推翻**：改走上面的"工作区间 confinement + 安全检查"。`shell` 工具保留（更名 `Bash`、并入统一注册表的 Native backend），但**不再裹 OS 沙箱**——`SeatbeltSandbox`/`AsrtSandbox` 作废待删。原"shell 需先有沙箱才能放"的硬前置随之解除：Bash 现在靠 ④.d 的安全级别（L2 默认问人）+ 工作区间路径校验把关。
 
 ### ④ 子模块依赖与推进顺序
 1. **④.a 是地基**——其他三个都假设有 plan / act 区分
 2. **④.b 紧随 ④.a**——plan 步骤要靠谱上下文才能不瞎想；没有分层记忆，plan 退化成"猜"
 3. **④.c 在 ④.a + ④.b 之上**——要有 plan 才能比对结果，要有记忆才能记下 retry 历史
-4. **④.d 最后**——前 3 个稳了再加。沙箱是 hardening，不是地基
+4. **④.d 最后**——前 3 个稳了再加。安全检查是 hardening，不是地基（注：工作区间 confinement 的 L3 路径校验属底线，需随 Bash/文件工具一起上；可配的安全级别策略可后补）
 
 ### 跨块影响提醒
 - **④.a 的 "plan" 要不要展现给 ①？** 默认是 ④ 的内部状态。如果以后做"agent 思考可见"——加 ② 的事件类型，**不允许** ④ 直接调 UI 或写 IPC
 - **④.c 的 retry 是否要落 ⑥？** retry 历史属于"私人笔记层"（④.b 的语义），落盘时通过 ⑥ 的接口，但语义归 ④.b
-- **④.d 沙箱实现可能挂载 ⑤ 之外的工具**（dry-run executor / temp workspace mount）——这些是 ④.d 内部细节，不是新的 provider
+- **④.d 安全检查不引入新 provider**——危险分级 / 路径校验 / 安全级别都是 ④ 内部逻辑，挂在 Call 工具执行前的关卡上，与 ⑤ 无关
 
 ## ⑤ LLM Provider
 - **Files**: `src-tauri/src/llm/*` (`bailian.rs`, `mod.rs`)
@@ -293,7 +385,7 @@ CC 的沙箱不是容器/VM，是 **OS 原语**：**macOS = Seatbelt（`sandbox-
 Two pieces of data each flow down **two independent pipes**. Mixing the
 pipes is the bug source. State them explicitly:
 
-### MCP 工具调用结果
+### 工具调用结果（任何 Call 工具——fs/Bash/MCP/recall…，事件统一走 `TOOL_CALL_EVENT`）
 - → 进 ④ (next LLM turn's `tool` message): **summary**, token-aware
 - → 进 ⑥ + 通过 ② 给 ①: **full body**, no token cost
 - Implication: shortening what the UI shows is a block-① concern and **must not** edit anything in block ④. Lengthening what the LLM sees is a block-④ concern and **must not** touch the event payload.

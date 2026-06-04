@@ -40,31 +40,34 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use crate::agent::approval::{
-    classify, ApprovalRegistry, ApprovalRequest, Danger, Decision, LookupResult, PendingApprovals,
+    classify, ApprovalRegistry, ApprovalRequest, Decision, LookupResult, PendingApprovals,
     APPROVAL_REQUEST_EVENT, APPROVAL_TIMEOUT_SECS,
 };
 use crate::agent::context::build_level_0_context;
 use crate::agent::dispatcher::DispatcherHandle;
-use crate::agent::mcp::{truncate, McpClient, MCP_CALL_EVENT, MCP_PREVIEW_MAX};
+use crate::agent::fs_tools::FileTools;
+use crate::agent::lsp_pool::LspPool;
+use crate::agent::mcp::{truncate, McpClient, TOOL_CALL_EVENT, MCP_PREVIEW_MAX};
 use crate::agent::mcp_log::McpLogHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
-use crate::agent::protocol::message_tools;
-use crate::agent::recall::query_tools;
-use crate::agent::role::{McpAccess as RoleMcpAccess, RoleConfig};
+use crate::agent::role::RoleConfig;
 use crate::agent::roles::PM_ID;
-use crate::agent::scratchpad::{scratchpad_tools, Scratchpad};
+use crate::agent::scratchpad::Scratchpad;
 use crate::agent::state::AgentState;
+use crate::agent::tools::advertised_tools;
 use crate::llm::bailian::BailianProvider;
-use crate::llm::Tool;
+use crate::llm::ChatMessage;
 
 use std::collections::VecDeque;
 
-use crate::agent::llm_source::{set_plan_tool, LlmSource};
-use crate::agent::mcp::McpCallEvent;
+use crate::agent::llm_source::LlmSource;
+use crate::agent::mcp::ToolCallEvent;
 use crate::agent::mcp_executor::{
     ApprovalOutcome, Approver, CallSink, CompositeExecutor, McpClientBackend, McpExecutor,
 };
-use crate::agent::react::{AlwaysContinue, NullSink, PlanLoop, TurnOutcome, TurnState};
+use crate::agent::memory::{assemble_bundle, MemoryStore, TopicTracker};
+use crate::agent::shell::{BashRegistry, BashTool};
+use crate::agent::react::{AlwaysContinue, NullSink, Outbound, PlanLoop, TurnOutcome, TurnState};
 use crate::agent::turn_bridge::{ask_to_kind, outbound_to_kind};
 
 // (Sprint-4 auxiliary-loop helpers removed in the #2b cutover: the ReAct
@@ -72,37 +75,10 @@ use crate::agent::turn_bridge::{ask_to_kind, outbound_to_kind};
 // the PlanLoop owns turn termination and the CompositeExecutor owns tool
 // routing.)
 
-/// All tools advertised on every LLM call: action message tools + query
-/// tools (Sprint 2.7) + scratchpad tools (Sprint 2.8) + the slice of MCP
-/// filesystem tools the role's `mcp_access` permits (Sprint 4 + the role-
-/// scoping refinement after the first GUI run).
-///
-/// Filtering BEFORE advertising is deliberate: the model literally can't
-/// pick what it isn't shown. PM can't accidentally write code when only
-/// engineers see `fs__write_file`.
-fn build_all_tools(mcp: Option<&McpClient>, access: RoleMcpAccess) -> Vec<Tool> {
-    let mut tools = message_tools();
-    tools.extend(query_tools());
-    tools.extend(scratchpad_tools());
-
-    if matches!(access, RoleMcpAccess::None) {
-        return tools;
-    }
-
-    if let Some(client) = mcp {
-        for t in client.advertised_tools() {
-            let allowed = match access {
-                RoleMcpAccess::All => true,
-                RoleMcpAccess::ReadOnly => matches!(classify(&t.function.name), Danger::ReadOnly),
-                RoleMcpAccess::None => unreachable!("None short-circuited above"),
-            };
-            if allowed {
-                tools.push(t.clone());
-            }
-        }
-    }
-    tools
-}
+// 工具广告现在由统一注册表驱动（CLAUDE.md ④「工具调用系统」）：
+// `tools::advertised_tools(&role.tools, mcp)` 按角色目录逐名过滤注册表 + 过渡 fs__
+// 授权。旧的 `build_all_tools` + `mcp_access` 过滤已退役。结构性门控（三层防御
+// layer 2）= 不在目录里就 advertise 不出去。
 
 /// Everything the runtime needs at spawn time. Holding this as a struct
 /// keeps the spawn_agent signature stable as Sprint 3+ adds more recovered
@@ -124,6 +100,13 @@ pub struct AgentBoot {
     /// successful `update_scratchpad` so crashes never lose more than the
     /// in-flight LLM call.
     pub scratchpad_path: PathBuf,
+    /// ④.b memory root for this agent (`{session}/agents/{id}/memory`). The
+    /// turn host persists the plan here as a topic after each turn.
+    pub memory_root: PathBuf,
+    /// The session workspace dir — native file tools confine writes/deletes to it.
+    pub workspace_dir: PathBuf,
+    /// Session-scoped LSP server pool (shared Arc across all agents). Cheap clone.
+    pub lsp_pool: LspPool,
     /// Shared MCP client handle (Sprint 4). `None` when the filesystem
     /// MCP server failed to start — agents run chat-only in that case.
     pub mcp: Option<McpClient>,
@@ -172,6 +155,11 @@ struct SuspendedTurn {
     ask_id: String,
     /// Topic to stamp on messages when the turn resumes.
     topic: TopicId,
+    /// If this turn was triggered by an ASK_AGENT directed at us, the id of
+    /// that ask — so on turn-end we can auto-ANSWER it if the agent forgot to
+    /// (otherwise the asker hangs in WAITING_ANSWER forever). Carried across
+    /// suspend/resume since the original ask spans the whole turn.
+    answering: Option<String>,
 }
 
 /// Real approval seam: delegates to [`gate_mcp_call`]. Headless (no UI) proceeds
@@ -207,9 +195,9 @@ struct RealCallSink {
 }
 
 impl CallSink for RealCallSink {
-    async fn record(&self, event: McpCallEvent) {
+    async fn record(&self, event: ToolCallEvent) {
         if let Some(handle) = &self.app_handle {
-            if let Err(e) = handle.emit(MCP_CALL_EVENT, &event) {
+            if let Err(e) = handle.emit(TOOL_CALL_EVENT, &event) {
                 tracing::warn!(
                     target: "aidock::agent",
                     error = %e,
@@ -233,6 +221,9 @@ async fn run_agent(boot: AgentBoot) {
         initial_state,
         initial_scratchpad,
         scratchpad_path,
+        memory_root,
+        workspace_dir,
+        lsp_pool,
         mcp,
         app_handle,
         approval,
@@ -240,16 +231,20 @@ async fn run_agent(boot: AgentBoot) {
         mcp_log,
     } = boot;
 
-    // Tools: set_plan (④.a) prepended to the role's message/aux/MCP tools.
-    let mut tools = vec![set_plan_tool()];
-    tools.extend(build_all_tools(mcp.as_ref(), role.mcp_access));
+    // Tools: 统一注册表按角色目录过滤广告（set_plan / recall_detail / shell / fs__
+    // 全在注册表里，由 `role.tools` 决定可见——CLAUDE.md ④「工具调用系统」）。
+    let tools = advertised_tools(&role.tools, mcp.as_ref());
+    // Bash 是否启用 = 目录里有没有它（PM 无）。step 4 起底线改走安全检查。
+    let bash_enabled = role.tools.iter().any(|t| t == crate::agent::shell::TOOL_BASH);
+    // 后台进程登记表：per-agent、跨回合存活（cloned 进每回合的 BashTool）。
+    let bash_registry = BashRegistry::new();
 
     tracing::info!(
         target: "aidock::agent",
         role = %role.id,
         recovered_msgs = initial_history.len(),
         state = initial_state.tag(),
-        mcp_access = ?role.mcp_access,
+        security_level = ?role.security_level,
         advertised_tools = tools.len(),
         "agent task started (ReAct turn host)"
     );
@@ -263,6 +258,13 @@ async fn run_agent(boot: AgentBoot) {
     let mut scratchpad: Option<Scratchpad> = Some(initial_scratchpad);
     let mut suspended: Option<SuspendedTurn> = None;
     let mut deferred: VecDeque<AgentMessage> = VecDeque::new();
+
+    // ④.b memory: persist the plan as a topic after each turn. Read-side
+    // (feeding the bundle back into context) is a later slice; for now this is
+    // write-only — the plan survives across turns/restarts on disk.
+    let mem_store = MemoryStore::new(memory_root);
+    let mut topics = TopicTracker::default();
+    topics.recover(&mem_store);
 
     loop {
         // Drain a deferred trigger when idle & nothing parked; else block on
@@ -309,15 +311,33 @@ async fn run_agent(boot: AgentBoot) {
                 let (outcome, turnstate) = plan_loop.resume(parked.state, answer).await;
                 handle_outcome(
                     &role, &dispatcher, &mut state, &mut history, &mut scratchpad,
-                    &mut suspended, plan_loop, outcome, turnstate, parked.topic,
+                    &mut suspended, &mem_store, &mut topics, plan_loop, outcome, turnstate,
+                    parked.topic, parked.answering,
                 )
                 .await;
             }
             Disposition::StartTurn => {
                 let topic = msg.topic_id.clone();
+                // If a teammate's ASK_AGENT triggered this turn, remember its id
+                // so we auto-ANSWER on turn-end (lest the asker hang forever).
+                let answering = match &msg.kind {
+                    AgentMessageKind::AskAgent { to, .. } if to == &role.id => Some(msg.id.clone()),
+                    _ => None,
+                };
                 let pad = scratchpad.take().expect("scratchpad present when idle");
                 // Build context BEFORE moving the scratchpad into the executor.
-                let context = build_level_0_context(&role, &history, &msg, &pad);
+                let mut context = build_level_0_context(&role, &history, &msg, &pad);
+                // ④.b read-side: feed the open topic's plan back as memory so
+                // the agent continues its plan instead of re-deriving it. (No
+                // step details yet — guardian/detail-capture is a later slice.)
+                if let Some(tid) = topics.current() {
+                    if let Some(plan) = mem_store.read_topic_plan(tid) {
+                        let bundle = assemble_bundle(&mem_store, tid, &plan);
+                        if !bundle.is_empty() {
+                            context.push(ChatMessage::System { content: bundle });
+                        }
+                    }
+                }
                 let source = LlmSource::new(
                     provider.clone(),
                     role.model.primary.clone(),
@@ -344,12 +364,20 @@ async fn run_agent(boot: AgentBoot) {
                     history.clone(),
                     pad,
                     scratchpad_path.clone(),
+                    mem_store.clone(),
+                    BashTool::new(workspace_dir.clone(), bash_enabled, bash_registry.clone()),
+                    FileTools::new(workspace_dir.clone()),
+                    role.security_level,
+                    workspace_dir.clone(),
+                    role.permission_rules.clone(),
+                    lsp_pool.clone(),
                 );
                 let mut plan_loop = PlanLoop::new(source, composite, AlwaysContinue, NullSink);
                 let (outcome, turnstate) = plan_loop.run_turn().await;
                 handle_outcome(
                     &role, &dispatcher, &mut state, &mut history, &mut scratchpad,
-                    &mut suspended, plan_loop, outcome, turnstate, topic,
+                    &mut suspended, &mem_store, &mut topics, plan_loop, outcome, turnstate,
+                    topic, answering,
                 )
                 .await;
             }
@@ -371,18 +399,65 @@ async fn handle_outcome(
     history: &mut Vec<AgentMessage>,
     scratchpad: &mut Option<Scratchpad>,
     suspended: &mut Option<SuspendedTurn>,
+    mem_store: &MemoryStore,
+    topics: &mut TopicTracker,
     plan_loop: LiveLoop,
     outcome: TurnOutcome,
     mut turnstate: TurnState,
     topic: TopicId,
+    // If this turn was triggered by an ASK directed at us, that ask's id —
+    // auto-ANSWERed on turn-end if the agent didn't answer it itself.
+    answering: Option<String>,
 ) {
+    // ④.b: persist the turn's plan into its 大主题 (mint/update, close if all
+    // steps done). A turn with no plan (agent didn't call set_plan — e.g. a
+    // trivial one-line answer) has nothing to persist.
+    match turnstate.plan.as_ref() {
+        Some(plan) => match topics.record(mem_store, plan, now_ms()) {
+            Ok(tid) => tracing::info!(
+                target: "aidock::agent", role = %role.id, topic = %tid,
+                steps = plan.steps.len(), "memory: persisted plan to topic"
+            ),
+            Err(e) => tracing::warn!(
+                target: "aidock::agent", role = %role.id, error = %e, "memory: persist plan FAILED"
+            ),
+        },
+        None => tracing::info!(
+            target: "aidock::agent", role = %role.id,
+            "memory: turn had no plan (agent didn't call set_plan) — nothing to persist"
+        ),
+    }
+
     // Drain outward messages (broadcasts / answers) the turn accumulated.
+    // Track whether the agent itself answered the ASK that triggered this turn.
+    let mut answered_ask = false;
     for out in turnstate.outgoing.drain(..) {
+        if let Outbound::Answer { reply_to, .. } = &out {
+            if answering.as_deref() == Some(reply_to.as_str()) {
+                answered_ask = true;
+            }
+        }
         dispatch_kind(role, outbound_to_kind(out), &topic, dispatcher, state, history).await;
     }
 
+    // If a teammate's ASK triggered this turn and the agent ended it WITHOUT
+    // answering, auto-ANSWER so the asker unblocks. The bug this fixes: an
+    // agent did the work then emitted DONE instead of ANSWER → the asker hung
+    // in WAITING_ANSWER forever, and the user's next message got deferred
+    // behind it. `should_auto_answer` is true only when we have an unanswered
+    // triggering ask; a *suspended* turn carries `answering` forward instead.
+    let pending_answer_id = if answered_ask { None } else { answering.clone() };
+
     match outcome {
         TurnOutcome::Done { summary } => {
+            if let Some(ask_id) = &pending_answer_id {
+                dispatch_kind(
+                    role,
+                    AgentMessageKind::Answer { reply_to: ask_id.clone(), content: summary.clone() },
+                    &topic, dispatcher, state, history,
+                )
+                .await;
+            }
             dispatch_kind(
                 role,
                 AgentMessageKind::Done { summary, artifact_id: None },
@@ -395,6 +470,14 @@ async fn handle_outcome(
             *scratchpad = Some(plan_loop.executor.into_scratchpad());
         }
         TurnOutcome::Escalated { reason } => {
+            if let Some(ask_id) = &pending_answer_id {
+                dispatch_kind(
+                    role,
+                    AgentMessageKind::Answer { reply_to: ask_id.clone(), content: format!("（未能完成）{reason}") },
+                    &topic, dispatcher, state, history,
+                )
+                .await;
+            }
             // No human Esc in multi-agent; tell the team we're stuck.
             dispatch_kind(
                 role,
@@ -421,11 +504,14 @@ async fn handle_outcome(
             )
             .await; // transitions state → WaitingAnswer{for_message: ask_id}
             // Park the live loop (scratchpad rides inside it) until the answer.
+            // Carry `answering` so the original ASK still gets answered when
+            // this turn eventually ends.
             *suspended = Some(SuspendedTurn {
                 plan_loop,
                 state: turnstate,
                 ask_id,
                 topic,
+                answering,
             });
         }
     }
@@ -666,44 +752,38 @@ async fn gate_mcp_call(
         "awaiting user approval"
     );
 
-    let decision = match tokio::time::timeout(
-        Duration::from_secs(APPROVAL_TIMEOUT_SECS),
-        rx,
-    )
-    .await
-    {
-        Ok(Ok(d)) => d,
+    match tokio::time::timeout(Duration::from_secs(APPROVAL_TIMEOUT_SECS), rx).await {
+        Ok(Ok(decision)) => {
+            // A REAL user decision — remember it so AllowSession actually
+            // sticks (subsequent calls of this tool then auto-proceed).
+            registry.remember(agent, tool, decision).await;
+            if decision.allows_execution() {
+                ApprovalOutcome::Proceed
+            } else {
+                ApprovalOutcome::Rejected("user rejected this tool call".to_string())
+            }
+        }
         Ok(Err(_)) => {
-            // Sender dropped without firing — treat as rejection.
+            // Channel dropped — deny THIS call only; do NOT remember (a
+            // dropped channel isn't the user saying "no to everything").
             tracing::warn!(
-                target: "aidock::agent",
-                agent,
-                tool,
-                request_id = %id,
-                "approval sender dropped; auto-rejecting"
+                target: "aidock::agent", agent, tool, request_id = %id,
+                "approval channel dropped; denying this call (not remembered)"
             );
-            Decision::Reject
+            ApprovalOutcome::Rejected("approval channel closed".to_string())
         }
         Err(_) => {
+            // Timed out — deny THIS call only; do NOT remember. A missed
+            // prompt must not poison the whole session (the old bug: timeout
+            // remembered Reject → every later write silently denied).
             pending.lock().await.remove(&id);
             tracing::warn!(
-                target: "aidock::agent",
-                agent,
-                tool,
-                request_id = %id,
+                target: "aidock::agent", agent, tool, request_id = %id,
                 timeout_s = APPROVAL_TIMEOUT_SECS,
-                "approval timed out; auto-rejecting"
+                "approval timed out; denying this call (not remembered)"
             );
-            Decision::Reject
+            ApprovalOutcome::Rejected("approval timed out — no response in time".to_string())
         }
-    };
-
-    registry.remember(agent, tool, decision).await;
-
-    if decision.allows_execution() {
-        ApprovalOutcome::Proceed
-    } else {
-        ApprovalOutcome::Rejected("user rejected this tool call".to_string())
     }
 }
 

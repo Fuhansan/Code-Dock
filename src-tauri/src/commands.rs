@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::agent::approval::{new_pending_approvals, ApprovalRegistry, Decision, PendingApprovals};
-use crate::agent::mcp::McpCallEvent;
+use crate::agent::mcp::ToolCallEvent;
 use crate::agent::mcp_log::{read_mcp_calls, MCP_LOG_FILE};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
@@ -242,7 +242,7 @@ pub async fn load_message_history() -> Result<Vec<AgentMessage>, CommandError> {
 /// so reloaded sessions can show prior tool-call cards too, not just
 /// messages.
 #[tauri::command]
-pub async fn load_mcp_call_history() -> Result<Vec<McpCallEvent>, CommandError> {
+pub async fn load_mcp_call_history() -> Result<Vec<ToolCallEvent>, CommandError> {
     let path = default_session_dir().join(MCP_LOG_FILE);
     let calls = read_mcp_calls(&path).map_err(|e| {
         CommandError::Llm(LLMError::Other(format!(

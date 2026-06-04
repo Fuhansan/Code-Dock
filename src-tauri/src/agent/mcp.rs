@@ -38,16 +38,31 @@ use crate::llm::Tool as LlmTool;
 /// MCP tool?" without a registry lookup.
 pub const MCP_TOOL_PREFIX: &str = "fs__";
 
+/// True iff `name` is an MCP-sourced tool — the legacy reference filesystem
+/// server (`fs__*`) or a user MCP server (`mcp__server__tool`). Used by the
+/// unified ④.d security check + executor routing so MCP isn't special-cased.
+pub fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with(MCP_TOOL_PREFIX) || name.starts_with("mcp__")
+}
+
 /// Tauri event name the frontend subscribes to for live MCP tool call
 /// visibility (Sprint 4.5). Emitted from the agent runtime, one event per
 /// executed MCP tool call.
-pub const MCP_CALL_EVENT: &str = "aidock:mcp_call";
+pub const TOOL_CALL_EVENT: &str = "aidock:tool_call";
 
-/// What the front-end sees for one MCP tool execution. Lightweight by
-/// design — args / result are truncated previews, full audit lives in
-/// tracing logs.
+/// What the front-end sees for one MCP tool execution.
+///
+/// `args` and `result` carry the **full** payload — UI display happens
+/// on the JS side, where per-tool formatters pick a one-line summary
+/// and the user can click-to-expand for the raw body. Only an emergency
+/// `MCP_EVENT_BODY_MAX` cap kicks in to keep a runaway tool from
+/// blowing up the event channel + JSONL log.
+///
+/// Note: these fields do NOT enter the LLM context. The agent's prompt
+/// uses its own (much shorter) summary path. So there is no token cost
+/// to keeping them full here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct McpCallEvent {
+pub struct ToolCallEvent {
     /// Stable id for de-duplication on the frontend if needed.
     pub id: String,
     /// Unix milliseconds, same clock as AgentMessage timestamps so a
@@ -57,18 +72,28 @@ pub struct McpCallEvent {
     pub agent: String,
     /// Full LLM-side tool name (with `fs__` prefix).
     pub tool: String,
-    /// Truncated argument JSON for display. Capped at PREVIEW_MAX chars.
-    pub args_preview: String,
-    /// Truncated result body for display. Capped at PREVIEW_MAX chars.
-    pub result_preview: String,
+    /// Full argument JSON as the LLM produced it. `serde(alias)` keeps
+    /// older `mcp_calls.jsonl` lines (written when the field was named
+    /// `args_preview`) deserialisable on reload.
+    #[serde(alias = "args_preview")]
+    pub args: String,
+    /// Full result body from the MCP server (or the synthesised failure
+    /// string we substituted on error).
+    #[serde(alias = "result_preview")]
+    pub result: String,
     /// True iff the result didn't begin with "ERROR:".
     pub success: bool,
 }
 
-/// Cap on args / result preview length. Long writes get a `…` ellipsis
-/// so the UI stays compact and the prompt-side render_tool_result still
-/// has the full text for the LLM.
+/// Cap on args / result length used by the approval banner. Short by
+/// design — the banner wants a glance, not the full body. The MCP-call
+/// event uses [`MCP_EVENT_BODY_MAX`] instead and stays full-fidelity.
 pub const MCP_PREVIEW_MAX: usize = 200;
+
+/// Emergency cap on per-call payload that *does* land in the event +
+/// JSONL log. Realistic tool calls (file reads/writes) are well under
+/// this; we just don't want a stray tool to be able to spam the disk.
+pub const MCP_EVENT_BODY_MAX: usize = 1 << 20; // 1 MiB
 
 /// Build an event from a raw arg JSON + a result string. The runtime
 /// calls this immediately after a successful (or error-returned)
@@ -79,17 +104,31 @@ pub fn make_call_event(
     raw_args: &str,
     result_body: &str,
     timestamp: i64,
-) -> McpCallEvent {
+) -> ToolCallEvent {
     let success = !result_body.trim_start().starts_with("ERROR:");
-    McpCallEvent {
+    ToolCallEvent {
         id: format!("mcpc-{}", uuid::Uuid::new_v4()),
         timestamp,
         agent: agent.to_string(),
         tool: tool.to_string(),
-        args_preview: truncate(raw_args, MCP_PREVIEW_MAX),
-        result_preview: truncate(result_body, MCP_PREVIEW_MAX),
+        args: cap_bytes(raw_args, MCP_EVENT_BODY_MAX),
+        result: cap_bytes(result_body, MCP_EVENT_BODY_MAX),
         success,
     }
+}
+
+/// UTF-8-safe byte cap. Used only as a runaway-tool safety net for
+/// `ToolCallEvent` — normal payloads pass through unchanged.
+fn cap_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = s.len() - cut;
+    format!("{}… [truncated, {omitted} more bytes]", &s[..cut])
 }
 
 /// Multibyte-safe truncation. Pub so the approval gate (Sprint 4.6) can
@@ -388,5 +427,58 @@ mod tests {
         );
         assert!(ev.success);
         assert!(ev.id.starts_with("mcpc-"));
+    }
+
+    #[test]
+    fn make_call_event_keeps_long_payload_intact() {
+        // The point of the Sprint 4.7 rework: UI-side previews used to
+        // truncate at 200 chars, losing the tail. The event itself must
+        // now carry the full body so the frontend can choose how much
+        // to show.
+        let big = "x".repeat(50_000);
+        let ev = make_call_event("PM", "fs__write_file", r#"{"path":"a"}"#, &big, 0);
+        assert_eq!(ev.result.len(), 50_000);
+        assert!(!ev.result.contains('…'));
+    }
+
+    #[test]
+    fn make_call_event_caps_runaway_payload() {
+        // Safety net: a tool that somehow returns >1 MiB gets clipped
+        // so it can't wedge the event channel or balloon mcp_calls.jsonl.
+        let huge = "y".repeat(MCP_EVENT_BODY_MAX + 100);
+        let ev = make_call_event("PM", "fs__read_file", r#"{}"#, &huge, 0);
+        assert!(ev.result.len() < MCP_EVENT_BODY_MAX + 200);
+        assert!(ev.result.contains("[truncated"));
+    }
+
+    #[test]
+    fn cap_bytes_respects_char_boundary() {
+        // Cutting mid-multibyte would panic; cap walks back to a
+        // valid boundary instead. Use a Chinese string where each
+        // char is 3 bytes — cap at 4 bytes should give us 1 char + suffix.
+        let s = "中文字符";
+        let out = cap_bytes(s, 4);
+        // Should keep 1 char (3 bytes), then suffix.
+        assert!(out.starts_with('中'));
+        assert!(out.contains("[truncated"));
+    }
+
+    #[test]
+    fn old_preview_field_names_still_deserialise() {
+        // Older mcp_calls.jsonl lines used `args_preview` / `result_preview`.
+        // The serde aliases must keep them readable so reload doesn't
+        // silently drop pre-rework history.
+        let legacy = r#"{
+            "id": "mcpc-x",
+            "timestamp": 1,
+            "agent": "PM",
+            "tool": "fs__write_file",
+            "args_preview": "{\"path\":\"a\"}",
+            "result_preview": "ok",
+            "success": true
+        }"#;
+        let ev: ToolCallEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(ev.args, r#"{"path":"a"}"#);
+        assert_eq!(ev.result, "ok");
     }
 }

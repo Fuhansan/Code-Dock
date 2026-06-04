@@ -29,8 +29,12 @@ use tokio::sync::{oneshot, Mutex};
 pub const APPROVAL_REQUEST_EVENT: &str = "aidock:approval_request";
 
 /// How long a pending approval waits before being auto-rejected. The user
-/// AFK shouldn't leave an agent task wedged forever.
-pub const APPROVAL_TIMEOUT_SECS: u64 = 60;
+/// AFK shouldn't leave an agent task wedged forever — but 60s was too tight
+/// for a human to notice + click "allow for session" (dev-test 2026-06-01:
+/// approvals landed after timeout). A timeout denies only THAT call and is
+/// NOT remembered (see `gate_mcp_call`), so a missed prompt no longer poisons
+/// the session.
+pub const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Payload the frontend sees for an approval prompt.
 #[derive(Debug, Clone, Serialize)]
