@@ -71,9 +71,23 @@ pub struct RoleConfig {
     pub display_name: String,
     /// Short, one-line description of responsibilities.
     pub description: String,
-    /// The Agent's system prompt. May be long, but should not embed runtime
-    /// state (which goes via context injection).
-    pub system_prompt: String,
+
+    /// The **coordinator**: the single activated role that fronts the user — it
+    /// (and only it) picks up the user's messages and dispatches the rest of the
+    /// team. A workshop has many members but exactly one coordinator (V0.1 = PM).
+    /// Replaces the old hardcoded `id == PM_ID` check so a future workshop can
+    /// name a different front-desk role without touching the runtime.
+    #[serde(default)]
+    pub is_coordinator: bool,
+
+    /// The role's **persona** — its identity, responsibilities, voice. This is
+    /// the user-editable part of the prompt. The multi-agent **protocol rules**
+    /// (`shared_rules()`) and the **team block** are NOT stored here; they are
+    /// injected at context-assembly time by `roles::compose_system_prompt`, so a
+    /// user editing a persona can never break the collaboration protocol
+    /// (CLAUDE.md ④ layer 1 — identity stays clean). May be long; must not embed
+    /// runtime state (that goes via context injection).
+    pub persona: String,
 
     pub model: ModelConfig,
     pub budget: Budget,
@@ -121,7 +135,8 @@ mod tests {
             id: "PM".into(),
             display_name: "Product Manager".into(),
             description: "x".into(),
-            system_prompt: "you are PM".into(),
+            is_coordinator: true,
+            persona: "you are PM".into(),
             model: ModelConfig {
                 provider: "bailian".into(),
                 primary: "qwen3.6-plus".into(),

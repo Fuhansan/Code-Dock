@@ -13,6 +13,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use aidock_lib::agent::approval::{new_pending_approvals, ApprovalRegistry};
+use aidock_lib::agent::roles::default_workshop;
 use aidock_lib::agent::Session;
 use aidock_lib::keyring_store;
 use serde_json::Value;
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     // bookkeeping.
     let session = Session::start(
         session_dir.clone(),
+        default_workshop(),
         api_key,
         None,
         ApprovalRegistry::new(),

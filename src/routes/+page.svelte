@@ -11,11 +11,13 @@
     resumeSession,
     renameSession,
     deleteSession,
+    listMembers,
     SESSION_TITLED_EVENT,
     MESSAGE_EVENT,
     TOOL_CALL_EVENT,
     type SessionMeta,
-    type SessionTitled
+    type SessionTitled,
+    type MemberInfo
   } from '$lib/ipc';
   import ApiKeySetup from '$lib/components/ApiKeySetup.svelte';
   import ChatPanel from '$lib/components/ChatPanel.svelte';
@@ -51,7 +53,11 @@
 
     // 思考动画：活跃会话只要有内部活动(消息/工具调用)就在左栏点亮"…"，
     // 静默 ~4s 后熄灭。纯 UI 指示，不回灌任何上下文。
-    unlistenMsg = await listen(MESSAGE_EVENT, () => bumpThinking());
+    // 消息流动会改变成员的工作状态（WORK_START/DONE/ASK/ANSWER）→ 顺手重拉成员。
+    unlistenMsg = await listen(MESSAGE_EVENT, () => {
+      bumpThinking();
+      refreshMembers();
+    });
     unlistenTool = await listen(TOOL_CALL_EVENT, () => bumpThinking());
   });
 
@@ -98,6 +104,7 @@
       const cur = await currentSession();
       activeSessionId = cur?.id ?? '';
       await refreshSessions();
+      await refreshMembers();
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
@@ -123,6 +130,7 @@
       const meta = await newSession();
       activeSessionId = meta.id;
       await refreshSessions();
+      await refreshMembers();
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
@@ -135,6 +143,7 @@
       await resumeSession(id);
       activeSessionId = id;
       await refreshSessions();
+      await refreshMembers();
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
@@ -206,6 +215,7 @@
       const cur = await currentSession();
       activeSessionId = cur?.id ?? '';
       await refreshSessions();
+      await refreshMembers();
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
@@ -217,31 +227,43 @@
     node.select();
   }
 
-  // 工作室成员面板。V0.1 静态：6 个角色原型——本工作室在用的 3 个(PM/前端/后端)=
-  // 就绪/忙碌，其余=离线/休息。TODO：接后端实时状态(AgentState) + 动态工作室成员。
-  type MemberStatus = 'ready' | 'busy' | 'rest' | 'offline';
+  // ---- 工作室成员（真实数据 + 实时工作状态）----
+  // 成员来自后端 roles::default_workshop()；状态从当前会话历史派生（list_members）。
+  // 消息流动时重拉，得到接近实时的状态。
+  type MemberStatus = 'idle' | 'working' | 'waiting_answer';
   const STATUS_META: Record<MemberStatus, { label: string; color: string }> = {
-    ready: { label: '就绪', color: '#22c55e' },
-    busy: { label: '忙碌', color: '#f59e0b' },
-    rest: { label: '休息中', color: '#3b82f6' },
-    offline: { label: '离线', color: '#9aa0b4' }
+    idle: { label: '就绪', color: '#22c55e' },
+    working: { label: '工作中', color: '#f59e0b' },
+    waiting_answer: { label: '等待回复', color: '#3b82f6' }
   };
-  const members: { name: string; desc: string; glyph: string; tint: string; status: MemberStatus }[] = [
-    { name: '项目经理（PM）', desc: '统筹规划，分解任务', glyph: '🧭', tint: '#efeaff', status: 'ready' },
-    { name: '前端工程师', desc: '负责前端开发实现', glyph: '</>', tint: '#e8f0ff', status: 'ready' },
-    { name: '后端工程师', desc: '负责后端服务开发', glyph: '🗄', tint: '#e6f7ee', status: 'busy' },
-    { name: '测试工程师', desc: '负责测试与质量保障', glyph: '🧪', tint: '#fff1e0', status: 'offline' },
-    { name: 'UI/UX 设计师', desc: '负责界面与用户体验', glyph: '🎨', tint: '#f1eaff', status: 'rest' },
-    { name: '文档工程师', desc: '负责文档编写与维护', glyph: '📄', tint: '#fff6da', status: 'offline' }
-  ];
+  // id → 中文展示（UI 装饰；后端 display_name 是英文，给 LLM 用的）。未知角色回落后端名。
+  const ROLE_UI: Record<string, { name: string; desc: string; glyph: string; tint: string }> = {
+    PM: { name: '项目经理（PM）', desc: '统筹规划，承接需求对接', glyph: '🧭', tint: '#efeaff' },
+    frontend_dev: { name: '前端工程师', desc: '负责前端开发实现', glyph: '</>', tint: '#e8f0ff' },
+    backend_dev: { name: '后端工程师', desc: '负责后端服务开发', glyph: '🗄', tint: '#e6f7ee' }
+  };
+  function roleUi(m: MemberInfo) {
+    return ROLE_UI[m.id] ?? { name: m.display_name, desc: m.description, glyph: '🤖', tint: '#eef0f4' };
+  }
+
+  let members = $state<MemberInfo[]>([]);
+  async function refreshMembers() {
+    try {
+      members = await listMembers();
+    } catch (e) {
+      console.warn('list members failed:', e);
+    }
+  }
+
   const legend = $derived(
-    (['ready', 'busy', 'rest', 'offline'] as MemberStatus[]).map((s) => ({
+    (['idle', 'working', 'waiting_answer'] as MemberStatus[]).map((s) => ({
       ...STATUS_META[s],
       count: members.filter((m) => m.status === s).length
     }))
   );
-  const availableCount = $derived(members.filter((m) => m.status === 'ready' || m.status === 'busy').length);
-  const availablePct = $derived(Math.round((availableCount / members.length) * 100));
+  // "就绪"=空闲、可接新任务。
+  const readyCount = $derived(members.filter((m) => m.status === 'idle').length);
+  const readyPct = $derived(members.length ? Math.round((readyCount / members.length) * 100) : 0);
 </script>
 
 <div class="app">
@@ -365,18 +387,25 @@
     </div>
 
     <ul class="member-list">
-      {#each members as m (m.name)}
-        <li class="member">
-          <span class="member-ico" style="background:{m.tint}">{m.glyph}</span>
+      {#each members as m (m.id)}
+        {@const ui = roleUi(m)}
+        <li class="member" class:primary={m.is_primary}>
+          <span class="member-ico" style="background:{ui.tint}">{ui.glyph}</span>
           <span class="member-meta">
-            <strong>{m.name}</strong>
-            <small>{m.desc}</small>
+            <strong>
+              {ui.name}
+              {#if m.is_primary}<span class="primary-chip">对接</span>{/if}
+            </strong>
+            <small>{m.status === 'working' && m.status_detail ? m.status_detail : ui.desc}</small>
           </span>
           <span class="badge" style="color:{STATUS_META[m.status].color}">
             <i class="bdot" style="background:{STATUS_META[m.status].color}"></i>{STATUS_META[m.status].label}
           </span>
         </li>
       {/each}
+      {#if members.length === 0}
+        <li class="member-empty">（成员加载中…）</li>
+      {/if}
     </ul>
 
     <div class="legend">
@@ -388,11 +417,11 @@
     <div class="status-block">
       <h3 class="panel-h">工作室状态</h3>
       <div class="status-row">
-        <div class="ring" style="--pct:{availablePct}%"><span class="ring-hole"></span></div>
+        <div class="ring" style="--pct:{readyPct}%"><span class="ring-hole"></span></div>
         <div class="status-info">
-          <strong>{availableCount}/{members.length} 成员可用</strong>
-          <small>当前有 {availableCount} 位成员可响应任务</small>
-          <div class="bar"><i style="width:{availablePct}%"></i></div>
+          <strong>{readyCount}/{members.length} 成员就绪</strong>
+          <small>{readyCount} 位空闲可接新任务 · {members.length - readyCount} 位忙碌</small>
+          <div class="bar"><i style="width:{readyPct}%"></i></div>
         </div>
       </div>
     </div>
@@ -1047,6 +1076,33 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
+  }
+  /* 主理/对接成员（PM）——进工作室后承接用户对话的激活角色，视觉上点出来。 */
+  .member.primary {
+    background: var(--brand-soft);
+    border-color: #d9d2ff;
+  }
+  .member.primary .member-ico {
+    box-shadow:
+      0 0 0 2px #fff,
+      0 0 0 4px var(--brand1);
+  }
+  .primary-chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #fff;
+    background: linear-gradient(135deg, var(--brand1), var(--brand2));
+    vertical-align: middle;
+  }
+  .member-empty {
+    list-style: none;
+    color: var(--faint);
+    font-size: 12.5px;
+    padding: 8px 4px;
   }
 
   .legend {

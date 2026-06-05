@@ -40,6 +40,7 @@ pub mod state;
 pub mod tools;
 pub mod topic;
 pub mod turn_bridge;
+pub mod workshop_store;
 
 pub use dispatcher::{Dispatcher, DispatcherError, DispatcherHandle, MESSAGE_EVENT};
 pub use message::{AgentId, AgentMessage, AgentMessageKind, MessageId, TopicId};

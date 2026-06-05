@@ -227,6 +227,26 @@ export function currentSession(): Promise<SessionMeta | null> {
   return invoke('current_session');
 }
 
+// ---------- 工作室成员 (workshop members) ----------
+
+/** One workshop member (role) + its live work status. Mirrors Rust `MemberInfo`. */
+export interface MemberInfo {
+  id: string;
+  display_name: string;
+  description: string;
+  /** The primary/active role that handles user conversation (V0.1 = PM). */
+  is_primary: boolean;
+  /** Live work status derived from the active session's history. */
+  status: 'idle' | 'working' | 'waiting_answer';
+  /** Task one-liner when working, else empty. */
+  status_detail: string;
+}
+
+/** The current workshop's members with live status. Re-call as messages flow. */
+export function listMembers(): Promise<MemberInfo[]> {
+  return invoke('list_members');
+}
+
 /** Rename a session (sets a custom title, overriding the LLM/derived one). */
 export function renameSession(id: string, title: string): Promise<void> {
   return invoke('rename_session', { id, title });

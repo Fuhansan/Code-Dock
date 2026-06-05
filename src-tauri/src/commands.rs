@@ -16,6 +16,7 @@ use crate::agent::mcp_log::{read_mcp_calls, MCP_LOG_FILE};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
 use crate::agent::session_store::{self, SessionMeta};
+use crate::agent::workshop_store;
 use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
@@ -166,8 +167,12 @@ async fn switch_to(
     {
         *state.session.lock().await = None;
     }
+    // 角色来自工作室定义（workshop.json，没有则种子）——而非写死。这样改了工作室
+    // 定义后重建会话即换上新角色（P2 热应用的机制基础）。
+    let roles = workshop_store::load_workshop(USER, WORKSHOP).roles;
     let session = Session::start(
         dir.clone(),
+        roles,
         key,
         Some(app),
         state.approval.clone(),
@@ -275,6 +280,59 @@ pub async fn current_session(
     Ok(session_store::list_sessions(USER, WORKSHOP)
         .into_iter()
         .find(|m| m.id == id))
+}
+
+/// 一个工作室成员（角色）的展示信息 + 实时工作状态。给右栏成员面板用。
+#[derive(serde::Serialize)]
+pub struct MemberInfo {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    /// 承接用户对话的**主理/激活**角色（V0.1 = PM，runtime 里唯一接 UserInput 的）。
+    /// 进工作室后它就是和用户对接的那个；其余成员被它调度。
+    pub is_primary: bool,
+    /// 实时工作状态（从当前会话历史派生）："idle" | "working" | "waiting_answer"。
+    pub status: String,
+    /// WORKING 时的任务一句话（给 UI 当副标题/tooltip），否则空串。
+    pub status_detail: String,
+}
+
+/// 当前工作室的成员 + 各自实时工作状态。成员来自 `roles::default_workshop()`；
+/// 状态从当前会话的 `messages.jsonl` 用 `AgentState::derive_from_history` 派生
+/// （无会话时全部 idle）。前端在消息流动时重拉，得到接近实时的状态。
+#[tauri::command]
+pub async fn list_members(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<MemberInfo>, CommandError> {
+    use crate::agent::state::AgentState;
+    let msgs = match state.active_dir.lock().await.clone() {
+        Some(dir) => {
+            persistence::read_jsonl_messages(&dir.join("messages.jsonl")).unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let members = crate::agent::roles::default_workshop()
+        .into_iter()
+        .map(|role| {
+            let (status, status_detail) =
+                match AgentState::derive_from_history(&msgs, &role.id) {
+                    AgentState::Idle => ("idle".to_string(), String::new()),
+                    AgentState::Working { task, .. } => ("working".to_string(), task),
+                    AgentState::WaitingAnswer { .. } => {
+                        ("waiting_answer".to_string(), String::new())
+                    }
+                };
+            MemberInfo {
+                is_primary: role.is_coordinator,
+                id: role.id,
+                display_name: role.display_name,
+                description: role.description,
+                status,
+                status_detail,
+            }
+        })
+        .collect();
+    Ok(members)
 }
 
 /// 重命名会话（写入 meta.json 的 title，覆盖 LLM/派生标题）。

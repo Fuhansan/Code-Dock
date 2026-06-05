@@ -77,8 +77,10 @@ pub fn build_level_0_context(
 
     // ---- System layer ----
 
-    let mut system = String::with_capacity(role.system_prompt.len() + 1024);
-    system.push_str(&role.system_prompt);
+    // persona（用户可编）+ 团队块 + 协作协议铁律（后两者注入、不可编）。
+    let composed = crate::agent::roles::compose_system_prompt(role);
+    let mut system = String::with_capacity(composed.len() + 1024);
+    system.push_str(&composed);
 
     // Scratchpad (Sprint 2.8) — pinned immediately under the role prompt so
     // the agent's own breadcrumbs are as prominent as its identity.

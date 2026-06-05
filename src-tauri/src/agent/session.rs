@@ -27,7 +27,7 @@ use crate::agent::lsp_pool::LspPool;
 use crate::agent::mcp::McpClient;
 use crate::agent::mcp_log::{spawn_writer as spawn_mcp_log_writer, McpLogHandle, MCP_LOG_FILE};
 use crate::agent::message::{AgentMessage, TopicId};
-use crate::agent::roles::default_workshop;
+use crate::agent::role::RoleConfig;
 use crate::agent::runtime::{spawn_agent, user_input_message, AgentBoot};
 use crate::agent::scratchpad::Scratchpad;
 use crate::agent::state::AgentState;
@@ -119,8 +119,13 @@ impl Session {
     /// user-configured `mcp__` servers.
     ///
     /// Pass `None` for `app_handle` to run headless (dev harnesses).
+    ///
+    /// `roles` is the workshop's roster (从 `workshop_store::load_workshop` 来；
+    /// dev harness 直接传 `default_workshop()`). Session 据此 spawn agents——角色
+    /// 不再写死在这里，于是改工作室定义后重建会话即换上新角色（热应用）。
     pub async fn start(
         session_dir: PathBuf,
+        roles: Vec<RoleConfig>,
         api_key: String,
         app_handle: Option<tauri::AppHandle>,
         approval: ApprovalRegistry,
@@ -157,7 +162,7 @@ impl Session {
         let lsp_pool = LspPool::new(workspace_dir.clone());
 
         let mut agent_tasks = Vec::new();
-        for role in default_workshop() {
+        for role in roles {
             let inbox_rx = dispatcher.register_agent(role.id.clone());
 
             // Sprint 3.3: per-agent recovery.

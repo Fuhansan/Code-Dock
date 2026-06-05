@@ -51,7 +51,6 @@ use crate::agent::mcp::{truncate, McpClient, TOOL_CALL_EVENT, MCP_PREVIEW_MAX};
 use crate::agent::mcp_log::McpLogHandle;
 use crate::agent::message::{AgentMessage, AgentMessageKind, TopicId};
 use crate::agent::role::RoleConfig;
-use crate::agent::roles::PM_ID;
 use crate::agent::scratchpad::Scratchpad;
 use crate::agent::state::AgentState;
 use crate::agent::tools::advertised_tools;
@@ -566,7 +565,7 @@ fn should_respond(role: &RoleConfig, state: &AgentState, msg: &AgentMessage) -> 
 
         // User input — only PM picks up. V0.1 keeps the human-facing surface
         // single-threaded through PM to avoid race conditions on the customer.
-        AgentMessageKind::UserInput { .. } => is_pm(role),
+        AgentMessageKind::UserInput { .. } => is_coordinator(role),
 
         // BROADCAST is pickup-optional per design §4.1. V0.1 makeshift
         // relevance filter (Sprint 2.6 replaces this):
@@ -574,7 +573,7 @@ fn should_respond(role: &RoleConfig, state: &AgentState, msg: &AgentMessage) -> 
         //   - Other agents pick up if the broadcast names their role id
         //   - WORKING agents stay focused — don't get distracted by broadcasts
         AgentMessageKind::Broadcast { content } => {
-            if is_pm(role) {
+            if is_coordinator(role) {
                 return true;
             }
             if !state.is_idle() {
@@ -643,8 +642,11 @@ fn classify_incoming(
     }
 }
 
-fn is_pm(role: &RoleConfig) -> bool {
-    role.id == PM_ID
+/// The coordinator = the activated front-desk role (V0.1 = PM). Config-driven
+/// now (`RoleConfig.is_coordinator`) instead of a hardcoded id, so a future
+/// workshop can pick a different coordinator without touching routing.
+fn is_coordinator(role: &RoleConfig) -> bool {
+    role.is_coordinator
 }
 
 // ---------- assembling and tracking outgoing messages ----------

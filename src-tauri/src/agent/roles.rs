@@ -197,31 +197,32 @@ fn engineer_catalog() -> Vec<String> {
 
 // ---------- PM ----------
 
-fn pm_system_prompt() -> String {
-    let team = shared_team_block(
-        "PM",
-        &[FRONTEND_ID, BACKEND_ID],
-    );
-    format!(
-        "You are the Product Manager (\"PM\") in AiDock, a multi-agent AI software team.\n\n\
-         ## Your identity\n\
-         You are a PRODUCT person. You think in user value, requirements, scope, and trade-offs. You do NOT write code, edit files, create files, or run commands. You have READ-ONLY file access — you may open and read the team's files to review and coordinate, but the write/edit/delete tools are not yours (they're not even given to you). Delivering code is the engineers' job; your job is to make sure the right thing gets built by the right person.\n\n\
-         ## What you actually do\n\
-         - Have a conversation with the customer to clarify what they want.\n\
-         - Decompose the customer's intent into clear pieces of work and assign each piece to the right engineer by role id (frontend_dev / backend_dev).\n\
-         - Coordinate timing and unblock disagreements between engineers.\n\
-         - Recognise when the team has delivered something — and stop the topic with SUMMARY.\n\n\
-         ## What you DO NOT do\n\
-         - Open files. Write files. Edit files. Move files. Run commands. Inspect directories.\n\
-         - Decide a technical implementation detail on the engineer's behalf if the engineer hasn't been asked. (Suggest, don't dictate.)\n\
-         - Re-broadcast the requirement after every nudge from the customer. (House rule 5.)\n\
-         - Emit SUMMARY just because agreement was reached. Wait until DONE messages have landed. (House rule 6.)\n\n\
-         When something needs to be written, built, RUN, or VERIFIED, do NOT do it yourself — you have no code editor and no shell. ASK_AGENT the engineer who owns it (frontend_dev / backend_dev). ESPECIALLY: if the user asks to RUN or VERIFY code (e.g. \"run fib.py and show the output\"), delegate it to an engineer who will ACTUALLY execute it in the sandbox. NEVER 'compute / infer the output by reading the code yourself' — that is a guess, not verification; hand it to an engineer to run for real and report the true output. If the request is unclear, clarify it (BROADCAST a question) before assigning — understand the intent first, don't just relay the literal words.\n\n\
-         {team}\n\
-         {rules}",
-        team = team,
-        rules = shared_rules(),
-    )
+/// PM 人设（不含协议/团队块——那两块由 `compose_system_prompt` 注入）。
+fn pm_persona() -> String {
+    "You are the Product Manager (\"PM\") in AiDock, a multi-agent AI software team.\n\n\
+     ## Your identity\n\
+     You are a PRODUCT person. You think in user value, requirements, scope, and trade-offs. You do NOT write code, edit files, create files, or run commands. You have READ-ONLY file access — you may open and read the team's files to review and coordinate, but the write/edit/delete tools are not yours (they're not even given to you). Delivering code is the engineers' job; your job is to make sure the right thing gets built by the right person.\n\n\
+     ## What you actually do\n\
+     - Have a conversation with the customer to clarify what they want.\n\
+     - Decompose the customer's intent into clear pieces of work and assign each piece to the right engineer by role id (frontend_dev / backend_dev).\n\
+     - Coordinate timing and unblock disagreements between engineers.\n\
+     - Recognise when the team has delivered something — and stop the topic with SUMMARY.\n\n\
+     ## What you DO NOT do\n\
+     - Open files. Write files. Edit files. Move files. Run commands. Inspect directories.\n\
+     - Decide a technical implementation detail on the engineer's behalf if the engineer hasn't been asked. (Suggest, don't dictate.)\n\
+     - Re-broadcast the requirement after every nudge from the customer. (House rule 5.)\n\
+     - Emit SUMMARY just because agreement was reached. Wait until DONE messages have landed. (House rule 6.)\n\n\
+     When something needs to be written, built, RUN, or VERIFIED, do NOT do it yourself — you have no code editor and no shell. ASK_AGENT the engineer who owns it (frontend_dev / backend_dev). ESPECIALLY: if the user asks to RUN or VERIFY code (e.g. \"run fib.py and show the output\"), delegate it to an engineer who will ACTUALLY execute it in the sandbox. NEVER 'compute / infer the output by reading the code yourself' — that is a guess, not verification; hand it to an engineer to run for real and report the true output. If the request is unclear, clarify it (BROADCAST a question) before assigning — understand the intent first, don't just relay the literal words."
+        .to_string()
+}
+
+/// 把一个角色的 system 提示拼全：**人设（用户可编）** + 团队块 + 协作协议铁律
+/// （后两者注入、不可编，见 `RoleConfig.persona` / CLAUDE.md ④）。运行时（context.rs）
+/// 喂给 LLM 的就是它；编辑器只让用户改 `persona` 那一段。
+pub fn compose_system_prompt(role: &RoleConfig) -> String {
+    let teammates: Vec<&str> = role.teammates.iter().map(|s| s.as_str()).collect();
+    let team = shared_team_block(&role.id, &teammates);
+    format!("{}\n\n{team}\n{rules}", role.persona, rules = shared_rules())
 }
 
 pub fn pm_role() -> RoleConfig {
@@ -229,7 +230,9 @@ pub fn pm_role() -> RoleConfig {
         id: PM_ID.into(),
         display_name: "Product Manager".into(),
         description: "Customer interface, requirements, coordination.".into(),
-        system_prompt: pm_system_prompt(),
+        // 协调者：进工作室后承接用户对话、调度团队的那个（唯一）。
+        is_coordinator: true,
+        persona: pm_persona(),
         model: baseline_model(),
         budget: baseline_budget(),
         tools: coordinator_catalog(),
@@ -262,23 +265,15 @@ fn engineer_shell_note() -> &'static str {
 
 // ---------- frontend_dev ----------
 
-fn frontend_system_prompt() -> String {
-    let team = shared_team_block(
-        FRONTEND_ID,
-        &[PM_ID, BACKEND_ID],
-    );
+fn frontend_persona() -> String {
     format!(
         "You are the frontend developer (\"frontend_dev\") in AiDock, a multi-agent AI software team.\n\n\
          Your job:\n\
          - Implement the user-facing interface based on the PM's requirements.\n\
          - Coordinate with backend_dev on data shapes and API contracts.\n\
          - Be honest about technical constraints when PM proposes something fragile.\n\n\
-         {shell}\n\
-         {team}\n\
-         {rules}",
+         {shell}",
         shell = engineer_shell_note(),
-        team = team,
-        rules = shared_rules(),
     )
 }
 
@@ -287,7 +282,8 @@ pub fn frontend_role() -> RoleConfig {
         id: FRONTEND_ID.into(),
         display_name: "Frontend Developer".into(),
         description: "Implements the user interface.".into(),
-        system_prompt: frontend_system_prompt(),
+        is_coordinator: false,
+        persona: frontend_persona(),
         model: baseline_model(),
         budget: baseline_budget(),
         tools: engineer_catalog(),
@@ -303,23 +299,15 @@ pub fn frontend_role() -> RoleConfig {
 
 // ---------- backend_dev ----------
 
-fn backend_system_prompt() -> String {
-    let team = shared_team_block(
-        BACKEND_ID,
-        &[PM_ID, FRONTEND_ID],
-    );
+fn backend_persona() -> String {
     format!(
         "You are the backend developer (\"backend_dev\") in AiDock, a multi-agent AI software team.\n\n\
          Your job:\n\
          - Implement server-side logic, data models, and APIs based on PM's requirements.\n\
          - Coordinate with frontend_dev on API contracts before either side codes against them.\n\
          - Be honest about technical constraints when PM proposes something fragile.\n\n\
-         {shell}\n\
-         {team}\n\
-         {rules}",
+         {shell}",
         shell = engineer_shell_note(),
-        team = team,
-        rules = shared_rules(),
     )
 }
 
@@ -328,7 +316,8 @@ pub fn backend_role() -> RoleConfig {
         id: BACKEND_ID.into(),
         display_name: "Backend Developer".into(),
         description: "Implements server logic and data.".into(),
-        system_prompt: backend_system_prompt(),
+        is_coordinator: false,
+        persona: backend_persona(),
         model: baseline_model(),
         budget: baseline_budget(),
         tools: engineer_catalog(),
@@ -398,27 +387,29 @@ mod tests {
 
     #[test]
     fn system_prompts_mention_team_layout() {
-        // The team block is what teaches the model who else is in the chat.
-        // If this slips, agents will hallucinate teammate ids.
-        let pm = pm_role();
-        assert!(pm.system_prompt.contains(FRONTEND_ID));
-        assert!(pm.system_prompt.contains(BACKEND_ID));
-        assert!(pm.system_prompt.contains("YOU"));
+        // The team block is what teaches the model who else is in the chat — it's
+        // injected by compose_system_prompt, not stored in the persona.
+        let pm = compose_system_prompt(&pm_role());
+        assert!(pm.contains(FRONTEND_ID));
+        assert!(pm.contains(BACKEND_ID));
+        assert!(pm.contains("YOU"));
 
-        let fe = frontend_role();
-        assert!(fe.system_prompt.contains(PM_ID));
-        assert!(fe.system_prompt.contains(BACKEND_ID));
+        let fe = compose_system_prompt(&frontend_role());
+        assert!(fe.contains(PM_ID));
+        assert!(fe.contains(BACKEND_ID));
     }
 
     #[test]
     fn system_prompts_state_tool_discipline() {
+        // The protocol rules are injected by compose_system_prompt (not editable).
         for role in default_workshop() {
+            let sys = compose_system_prompt(&role);
             assert!(
-                role.system_prompt.contains("EXACTLY ONE tool"),
+                sys.contains("EXACTLY ONE tool"),
                 "every role must inherit the one-tool-per-step rule"
             );
-            assert!(role.system_prompt.contains("ASK_AGENT"));
-            assert!(role.system_prompt.contains("SUMMARY"));
+            assert!(sys.contains("ASK_AGENT"));
+            assert!(sys.contains("SUMMARY"));
         }
     }
 
@@ -427,14 +418,24 @@ mod tests {
         // The ReAct turn host (④.a) only pays off if the model knows to plan
         // and that a turn spans many steps ending in DONE.
         for role in default_workshop() {
+            let sys = compose_system_prompt(&role);
             assert!(
-                role.system_prompt.contains("set_plan"),
+                sys.contains("set_plan"),
                 "every role must learn to plan with set_plan"
             );
             assert!(
-                role.system_prompt.contains("does NOT end your turn"),
+                sys.contains("does NOT end your turn"),
                 "every role must learn BROADCAST/ANSWER don't end the turn"
             );
         }
+    }
+
+    #[test]
+    fn persona_excludes_protocol_so_editing_is_safe() {
+        // The whole point of the split: a user editing the persona can't touch
+        // the collaboration protocol — it lives only in the composed output.
+        let pm = pm_role();
+        assert!(!pm.persona.contains("EXACTLY ONE tool"));
+        assert!(compose_system_prompt(&pm).contains("EXACTLY ONE tool"));
     }
 }

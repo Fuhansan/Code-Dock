@@ -27,14 +27,19 @@ pub fn aidock_root() -> PathBuf {
     PathBuf::from(home).join(".aidock")
 }
 
-/// `.../users/{user}/workshops/{workshop}/sessions`
-pub fn sessions_dir(user: &str, workshop: &str) -> PathBuf {
+/// `.../users/{user}/workshops/{workshop}` — the workshop's own directory
+/// (holds `workshop.json` + the `sessions/` subtree).
+pub fn workshop_dir(user: &str, workshop: &str) -> PathBuf {
     aidock_root()
         .join("users")
         .join(user)
         .join("workshops")
         .join(workshop)
-        .join("sessions")
+}
+
+/// `.../users/{user}/workshops/{workshop}/sessions`
+pub fn sessions_dir(user: &str, workshop: &str) -> PathBuf {
+    workshop_dir(user, workshop).join("sessions")
 }
 
 /// 一个具体会话的目录。

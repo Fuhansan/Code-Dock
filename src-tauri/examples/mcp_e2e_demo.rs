@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aidock_lib::agent::approval::{new_pending_approvals, ApprovalRegistry};
+use aidock_lib::agent::roles::default_workshop;
 use aidock_lib::agent::Session;
 use aidock_lib::keyring_store;
 use tokio::time::sleep;
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     let session = Session::start(
         session_dir.clone(),
+        default_workshop(),
         api_key,
         None,
         ApprovalRegistry::new(),
