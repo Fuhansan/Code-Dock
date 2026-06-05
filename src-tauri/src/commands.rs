@@ -15,8 +15,9 @@ use crate::agent::mcp::ToolCallEvent;
 use crate::agent::mcp_log::{read_mcp_calls, MCP_LOG_FILE};
 use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
+use crate::agent::role::RoleConfig;
 use crate::agent::session_store::{self, SessionMeta};
-use crate::agent::workshop_store;
+use crate::agent::workshop_store::{self, WorkshopDef};
 use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
@@ -333,6 +334,109 @@ pub async fn list_members(
         })
         .collect();
     Ok(members)
+}
+
+// ---------- 工作室 / 角色编辑（P2：工作室内编辑 + 热应用）----------
+
+/// 当前工作室的完整定义（给编辑器用）。
+#[tauri::command]
+pub async fn get_workshop() -> Result<WorkshopDef, CommandError> {
+    Ok(workshop_store::load_workshop(USER, WORKSHOP))
+}
+
+/// 增/改一个角色（按 id upsert，强制协调者全室唯一），落盘后**热应用**到在跑会话。
+#[tauri::command]
+pub async fn save_role(
+    role: RoleConfig,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let mut def = workshop_store::load_workshop(USER, WORKSHOP);
+    def.upsert_role(role);
+    workshop_store::save_workshop(USER, WORKSHOP, &def)
+        .map_err(|e| CommandError::Llm(LLMError::Other(format!("save role failed: {e}"))))?;
+    hot_reload_active_session(app, &state).await?;
+    Ok(())
+}
+
+/// 删一个角色（清 teammates 引用、保协调者、拒删到空），落盘后热应用。
+#[tauri::command]
+pub async fn delete_role(
+    role_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let mut def = workshop_store::load_workshop(USER, WORKSHOP);
+    def.remove_role(&role_id)
+        .map_err(|e| CommandError::Llm(LLMError::Other(e.to_string())))?;
+    workshop_store::save_workshop(USER, WORKSHOP, &def)
+        .map_err(|e| CommandError::Llm(LLMError::Other(format!("delete role failed: {e}"))))?;
+    hot_reload_active_session(app, &state).await?;
+    Ok(())
+}
+
+/// 改了工作室定义后，把在跑会话按新角色重建（立即生效）。复用 `switch_to(自身)`：
+/// drop 旧 Session → 用新角色从历史 rehydrate 重启。无在跑会话时是 no-op（下次进入
+/// 自然加载最新）。
+async fn hot_reload_active_session(
+    app: tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), CommandError> {
+    let dir = state.active_dir.lock().await.clone();
+    if let Some(dir) = dir {
+        switch_to(app, state, dir).await?;
+    }
+    Ok(())
+}
+
+/// 工具目录里的一项（给角色编辑器的"工具勾选"用）。
+#[derive(serde::Serialize)]
+pub struct ToolCatalogEntry {
+    pub name: String,
+    /// 展示分族：文件 / 终端 / 导航 / 记忆 / 协作。
+    pub group: String,
+    pub description: String,
+    /// 控制/协作类（消息/计划等）始终开、不可取消。
+    pub always_on: bool,
+}
+
+/// 全部可勾选工具（来自 `tools::static_registry`，按族分组）。
+#[tauri::command]
+pub async fn available_tools() -> Result<Vec<ToolCatalogEntry>, CommandError> {
+    use crate::agent::tools::{static_registry, Handling};
+    let entries = static_registry()
+        .iter()
+        .map(|spec| {
+            // 控制类（消息/挂起/收尾/计划）= 协作族，始终开；Call 类按名字分族、可勾。
+            let (group, always_on) = match spec.handling {
+                Handling::Message | Handling::Suspend | Handling::End | Handling::Plan => {
+                    ("协作", true)
+                }
+                Handling::Call { .. } => {
+                    let g = match spec.name() {
+                        "Read" | "Edit" | "Write" | "Glob" | "Grep" => "文件",
+                        "Bash" | "BashOutput" | "KillShell" => "终端",
+                        "LSP" => "导航",
+                        _ => "记忆",
+                    };
+                    (g, false)
+                }
+            };
+            ToolCatalogEntry {
+                name: spec.name().to_string(),
+                group: group.to_string(),
+                description: spec.tool.function.description.clone(),
+                always_on,
+            }
+        })
+        .collect();
+    Ok(entries)
+}
+
+/// 可选模型（V0.1：百炼几个）。编辑器的模型下拉用。
+#[tauri::command]
+pub async fn model_catalog() -> Result<Vec<String>, CommandError> {
+    Ok(vec!["qwen3.6-plus".to_string(), "qwen3.6-flash".to_string()])
 }
 
 /// 重命名会话（写入 meta.json 的 title，覆盖 LLM/派生标题）。

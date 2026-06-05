@@ -247,6 +247,90 @@ export function listMembers(): Promise<MemberInfo[]> {
   return invoke('list_members');
 }
 
+// ---------- 工作室/角色编辑 (workshop & role editing) ----------
+// 下列类型镜像 Rust `RoleConfig` / `WorkshopDef`。编辑器只改其中一部分字段，其余
+// （permission_rules 等）原样携带、回传 save_role 时不丢。
+
+export interface ModelConfig {
+  provider: string;
+  primary: string;
+  fallback?: string | null;
+  temperature: number;
+  max_tokens: number;
+  extended_thinking: boolean;
+}
+export interface Budget {
+  per_call_tokens: number;
+  per_session_tokens?: number | null;
+  per_session_calls?: number | null;
+}
+export interface PermissionRule {
+  tool: string;
+  pattern: string;
+  action: string; // RuleAction (snake_case)，编辑器暂原样携带
+}
+export type LoopMode = 'single' | 'react' | 'plan_execute';
+export type SecurityLevel = 'Strict' | 'Standard' | 'Permissive';
+
+export interface RoleConfig {
+  id: string;
+  display_name: string;
+  description: string;
+  is_coordinator: boolean;
+  /** 用户可编人设（协作协议由运行时注入，不在此）。 */
+  persona: string;
+  model: ModelConfig;
+  budget: Budget;
+  tools: string[];
+  teammates: string[];
+  loop_mode: LoopMode;
+  max_history_tokens?: number | null;
+  security_level: SecurityLevel;
+  permission_rules: PermissionRule[];
+}
+
+export interface WorkshopDef {
+  id: string;
+  name: string;
+  icon: string;
+  workspace_path: string;
+  roles: RoleConfig[];
+}
+
+export interface ToolCatalogEntry {
+  name: string;
+  /** 文件 / 终端 / 导航 / 记忆 / 协作 */
+  group: string;
+  description: string;
+  /** 控制/协作类始终开、不可取消。 */
+  always_on: boolean;
+}
+
+/** Current workshop's full definition (for the editor). */
+export function getWorkshop(): Promise<WorkshopDef> {
+  return invoke('get_workshop');
+}
+
+/** Upsert a role (coordinator kept unique) + hot-apply to the running session. */
+export function saveRole(role: RoleConfig): Promise<void> {
+  return invoke('save_role', { role });
+}
+
+/** Delete a role by id (cleans teammates, keeps a coordinator) + hot-apply. */
+export function deleteRole(roleId: string): Promise<void> {
+  return invoke('delete_role', { roleId });
+}
+
+/** All selectable tools, grouped, for the role editor's tool checklist. */
+export function availableTools(): Promise<ToolCatalogEntry[]> {
+  return invoke('available_tools');
+}
+
+/** Selectable models for the model dropdown. */
+export function modelCatalog(): Promise<string[]> {
+  return invoke('model_catalog');
+}
+
 /** Rename a session (sets a custom title, overriding the LLM/derived one). */
 export function renameSession(id: string, title: string): Promise<void> {
   return invoke('rename_session', { id, title });

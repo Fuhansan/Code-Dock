@@ -21,6 +21,7 @@
   } from '$lib/ipc';
   import ApiKeySetup from '$lib/components/ApiKeySetup.svelte';
   import ChatPanel from '$lib/components/ChatPanel.svelte';
+  import WorkshopEditor from '$lib/components/WorkshopEditor.svelte';
 
   // Sprint 0 health dot + Sprint 1 BYOK gate + chat panel mount.
 
@@ -246,6 +247,8 @@
     return ROLE_UI[m.id] ?? { name: m.display_name, desc: m.description, glyph: '🤖', tint: '#eef0f4' };
   }
 
+  let showWorkshopEditor = $state(false);
+
   let members = $state<MemberInfo[]>([]);
   async function refreshMembers() {
     try {
@@ -383,7 +386,7 @@
   <aside class="panel">
     <div class="panel-head">
       <h3 class="panel-h">工作室成员 <span class="info" title="本工作室的 agent 成员">ⓘ</span></h3>
-      <button class="pill subtle">管理成员</button>
+      <button class="pill subtle" onclick={() => (showWorkshopEditor = true)}>管理成员</button>
     </div>
 
     <ul class="member-list">
@@ -430,6 +433,10 @@
 
 {#if keyConfigured === false}
   <ApiKeySetup onSaved={handleKeySaved} />
+{/if}
+
+{#if showWorkshopEditor}
+  <WorkshopEditor onClose={() => (showWorkshopEditor = false)} onChanged={refreshMembers} />
 {/if}
 
 {#if openMenuId}
