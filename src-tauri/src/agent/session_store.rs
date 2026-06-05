@@ -27,14 +27,20 @@ pub fn aidock_root() -> PathBuf {
     PathBuf::from(home).join(".aidock")
 }
 
+/// `.../users/{user}/workshops` — holds all of a user's workshop dirs.
+pub fn workshops_root(user: &str) -> PathBuf {
+    aidock_root().join("users").join(user).join("workshops")
+}
+
 /// `.../users/{user}/workshops/{workshop}` — the workshop's own directory
 /// (holds `workshop.json` + the `sessions/` subtree).
 pub fn workshop_dir(user: &str, workshop: &str) -> PathBuf {
-    aidock_root()
-        .join("users")
-        .join(user)
-        .join("workshops")
-        .join(workshop)
+    workshops_root(user).join(workshop)
+}
+
+/// Generate a new workshop id: `ws-{unix_millis}_{rand8}` (sortable, safe).
+pub fn new_workshop_id() -> String {
+    format!("ws-{}", new_session_id())
 }
 
 /// `.../users/{user}/workshops/{workshop}/sessions`

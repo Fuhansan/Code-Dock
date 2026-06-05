@@ -331,6 +331,52 @@ export function modelCatalog(): Promise<string[]> {
   return invoke('model_catalog');
 }
 
+// ---------- 工作室生命周期 (workbench / multi-workshop) ----------
+
+/** A workshop summary card. Mirrors Rust `WorkshopMeta`. */
+export interface WorkshopMeta {
+  id: string;
+  name: string;
+  icon: string;
+  member_count: number;
+  workspace_path: string;
+}
+
+/** All of the user's workshops (for the workbench card wall). */
+export function listWorkshops(): Promise<WorkshopMeta[]> {
+  return invoke('list_workshops');
+}
+
+/** The active workshop id (workbench highlights it). */
+export function currentWorkshop(): Promise<string> {
+  return invoke('current_workshop');
+}
+
+/** Create a new workshop (seeded with the default team). */
+export function createWorkshop(name: string, icon: string): Promise<WorkshopMeta> {
+  return invoke('create_workshop', { name, icon });
+}
+
+/** Enter a workshop: switch active + resume its latest session. */
+export function enterWorkshop(id: string): Promise<void> {
+  return invoke('enter_workshop', { id });
+}
+
+/** Delete a workshop (and its sessions); switches away if it was active. */
+export function deleteWorkshop(id: string): Promise<void> {
+  return invoke('delete_workshop', { id });
+}
+
+/** Update a workshop's name/icon/workspace path. */
+export function saveWorkshopSettings(
+  id: string,
+  name: string,
+  icon: string,
+  workspacePath: string
+): Promise<void> {
+  return invoke('save_workshop_settings', { id, name, icon, workspacePath });
+}
+
 /** Rename a session (sets a custom title, overriding the LLM/derived one). */
 export function renameSession(id: string, title: string): Promise<void> {
   return invoke('rename_session', { id, title });

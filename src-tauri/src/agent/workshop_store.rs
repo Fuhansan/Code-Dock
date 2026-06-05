@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::agent::persistence::{self, PersistError};
 use crate::agent::role::RoleConfig;
 use crate::agent::roles::default_workshop;
-use crate::agent::session_store::workshop_dir;
+use crate::agent::session_store::{
+    new_workshop_id, workshop_dir, workshops_root, DEFAULT_WORKSHOP,
+};
 
 /// 一个工作室的完整定义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,98 @@ pub fn seed_workshop(ws: &str) -> WorkshopDef {
         workspace_path: String::new(),
         roles: default_workshop(),
     }
+}
+
+/// 工作台卡片墙用的轻量摘要（不带 roles 全量）。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkshopMeta {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub member_count: usize,
+    pub workspace_path: String,
+}
+
+impl WorkshopMeta {
+    fn from_def(def: &WorkshopDef) -> Self {
+        Self {
+            id: def.id.clone(),
+            name: def.name.clone(),
+            icon: def.icon.clone(),
+            member_count: def.roles.len(),
+            workspace_path: def.workspace_path.clone(),
+        }
+    }
+}
+
+/// 列出一个用户的全部工作室（扫 `workshops/` 子目录，每个 `load_workshop`）。
+/// 若一个都没有，先种出默认工作室再返回——保证工作台永远有得选。
+pub fn list_workshops(user: &str) -> Vec<WorkshopMeta> {
+    let root = workshops_root(user);
+    let mut out: Vec<WorkshopMeta> = match std::fs::read_dir(&root) {
+        Ok(entries) => entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .map(|id| WorkshopMeta::from_def(&load_workshop(user, &id)))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if out.is_empty() {
+        out.push(WorkshopMeta::from_def(&load_workshop(user, DEFAULT_WORKSHOP)));
+    }
+    // 创建时间在 id 前缀里（ws-{millis}_…），按它倒序——新建的在前；ws-default 垫底。
+    out.sort_by(|a, b| b.id.cmp(&a.id));
+    out
+}
+
+/// 新建工作室：用默认三人组做种子（立刻可用、含协调者），落盘后返回摘要。
+pub fn create_workshop(user: &str, name: &str, icon: &str) -> Result<WorkshopMeta, PersistError> {
+    let id = new_workshop_id();
+    let mut def = seed_workshop(&id);
+    def.name = if name.trim().is_empty() {
+        "新工作室".to_string()
+    } else {
+        name.trim().to_string()
+    };
+    def.icon = if icon.trim().is_empty() {
+        "🛠".to_string()
+    } else {
+        icon.trim().to_string()
+    };
+    save_workshop(user, &id, &def)?;
+    Ok(WorkshopMeta::from_def(&def))
+}
+
+/// 删除一个工作室（连其会话一起）。拒删最后一个（保证至少留一个）。
+pub fn delete_workshop(user: &str, ws: &str) -> Result<(), String> {
+    if list_workshops(user).len() <= 1 {
+        return Err("至少保留一个工作室".to_string());
+    }
+    std::fs::remove_dir_all(workshop_dir(user, ws)).map_err(|e| format!("删除失败: {e}"))
+}
+
+/// 改工作室设置（名称/图标/工作区间）。`workspace_path` 非空时校验为存在的目录。
+pub fn update_settings(
+    user: &str,
+    ws: &str,
+    name: &str,
+    icon: &str,
+    workspace_path: &str,
+) -> Result<(), String> {
+    let wp = workspace_path.trim();
+    if !wp.is_empty() && !std::path::Path::new(wp).is_dir() {
+        return Err(format!("工作区间不是有效目录: {wp}"));
+    }
+    let mut def = load_workshop(user, ws);
+    if !name.trim().is_empty() {
+        def.name = name.trim().to_string();
+    }
+    if !icon.trim().is_empty() {
+        def.icon = icon.trim().to_string();
+    }
+    def.workspace_path = wp.to_string();
+    save_workshop(user, ws, &def).map_err(|e| format!("保存失败: {e}"))
 }
 
 #[cfg(test)]

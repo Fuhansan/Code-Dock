@@ -17,7 +17,7 @@ use crate::agent::message::AgentMessage;
 use crate::agent::persistence;
 use crate::agent::role::RoleConfig;
 use crate::agent::session_store::{self, SessionMeta};
-use crate::agent::workshop_store::{self, WorkshopDef};
+use crate::agent::workshop_store::{self, WorkshopDef, WorkshopMeta};
 use crate::agent::{Session, SessionError};
 use crate::keyring_store::{self, KeyringError};
 use crate::llm::{
@@ -67,6 +67,9 @@ pub struct AppState {
     /// `load_*_history` / `current_session` target the active session's data
     /// (not a hardcoded path). Always set/cleared together with `session`.
     pub active_dir: Mutex<Option<PathBuf>>,
+    /// 当前活跃工作室 id（取代写死的 `WORKSHOP` const）。会话命令都按它取数据；
+    /// `enter_workshop` 切换它。默认 `ws-default`。
+    pub active_workshop: Mutex<String>,
     /// Sprint 4.6: per-session approval registry for destructive MCP
     /// tools. Lives in AppState so the `respond_to_approval` command can
     /// reach it without going through the session lock.
@@ -80,6 +83,7 @@ impl Default for AppState {
         Self {
             session: Mutex::new(None),
             active_dir: Mutex::new(None),
+            active_workshop: Mutex::new(session_store::DEFAULT_WORKSHOP.to_string()),
             approval: ApprovalRegistry::new(),
             pending_approvals: new_pending_approvals(),
         }
@@ -149,11 +153,14 @@ pub async fn send_chat_message(
 
 // ---------- Multi-agent session (Sprint 2) ----------
 
-// V0.1：单本地用户 + 单硬编码工作室。TODO（低优，无账号系统暂搁）：有真登录后
-// USER 换成账号 id；多工作室编辑器落地后 WORKSHOP 由用户建。路径布局
-// users/{USER}/workshops/{WORKSHOP}/sessions/{id} 已为这两层留好位，届时不返工。
+// V0.1：单本地用户（无账号系统）。TODO（低优）：有真登录后 USER 换成账号 id。
+// 工作室不再写死——`AppState.active_workshop` 持有当前工作室 id，会话命令按它取数据。
 const USER: &str = session_store::DEFAULT_USER;
-const WORKSHOP: &str = session_store::DEFAULT_WORKSHOP;
+
+/// 读当前活跃工作室 id。
+async fn current_ws(state: &AppState) -> String {
+    state.active_workshop.lock().await.clone()
+}
 
 /// Stop the current session (its `Drop` aborts the tasks) and start one at `dir`.
 /// The single chokepoint for start / new / resume so they all switch cleanly.
@@ -170,7 +177,7 @@ async fn switch_to(
     }
     // 角色来自工作室定义（workshop.json，没有则种子）——而非写死。这样改了工作室
     // 定义后重建会话即换上新角色（P2 热应用的机制基础）。
-    let roles = workshop_store::load_workshop(USER, WORKSHOP).roles;
+    let roles = workshop_store::load_workshop(USER, &current_ws(state).await).roles;
     let session = Session::start(
         dir.clone(),
         roles,
@@ -201,22 +208,31 @@ pub async fn start_session(
         tracing::debug!(target: "aidock::cmd", "start_session: already running");
         return Ok(());
     }
-    // 清掉残留空会话（新建后没发过消息的）——它们不该作为幽灵留到下次启动。
-    for meta in session_store::list_sessions(USER, WORKSHOP) {
-        let d = session_store::session_dir(USER, WORKSHOP, &meta.id);
+    let ws = current_ws(&state).await;
+    resume_workshop_session(app, &state, &ws).await
+}
+
+/// 进入/续接某工作室的会话：清掉残留空会话，续接剩下最近的真会话；一个都没有就
+/// **不造**，保持无活跃会话（前端显示 hero）。`start_session` 与 `enter_workshop` 共用。
+async fn resume_workshop_session(
+    app: tauri::AppHandle,
+    state: &AppState,
+    ws: &str,
+) -> Result<(), CommandError> {
+    for meta in session_store::list_sessions(USER, ws) {
+        let d = session_store::session_dir(USER, ws, &meta.id);
         if session_store::is_empty_session(&d) {
             let _ = std::fs::remove_dir_all(&d);
         }
     }
-    // 续接剩下里最近的真会话；一个都没有就**不造**，保持无活跃会话。
-    match session_store::list_sessions(USER, WORKSHOP).into_iter().next() {
+    match session_store::list_sessions(USER, ws).into_iter().next() {
         Some(meta) => {
-            let dir = session_store::session_dir(USER, WORKSHOP, &meta.id);
-            switch_to(app, &state, dir).await?;
-            tracing::info!(target: "aidock::cmd", "session resumed (most-recent non-empty)");
+            let dir = session_store::session_dir(USER, ws, &meta.id);
+            switch_to(app, state, dir).await?;
+            tracing::info!(target: "aidock::cmd", workshop = %ws, "session resumed");
         }
         None => {
-            tracing::info!(target: "aidock::cmd", "no sessions; idle until 新建/first message");
+            tracing::info!(target: "aidock::cmd", workshop = %ws, "no sessions; idle");
         }
     }
     Ok(())
@@ -228,11 +244,12 @@ pub async fn new_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<SessionMeta, CommandError> {
+    let ws = current_ws(&state).await;
     let id = session_store::new_session_id();
-    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    let dir = session_store::session_dir(USER, &ws, &id);
     switch_to(app, &state, dir).await?;
     tracing::info!(target: "aidock::cmd", session_id = %id, "new session created");
-    Ok(session_store::list_sessions(USER, WORKSHOP)
+    Ok(session_store::list_sessions(USER, &ws)
         .into_iter()
         .find(|m| m.id == id)
         .unwrap_or(SessionMeta {
@@ -251,7 +268,7 @@ pub async fn resume_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    let dir = session_store::session_dir(USER, &current_ws(&state).await, &id);
     if !dir.is_dir() {
         return Err(CommandError::SessionNotFound(id));
     }
@@ -262,8 +279,10 @@ pub async fn resume_session(
 
 /// History list: all sessions for the current user/workshop, newest first.
 #[tauri::command]
-pub async fn list_sessions() -> Result<Vec<SessionMeta>, CommandError> {
-    Ok(session_store::list_sessions(USER, WORKSHOP))
+pub async fn list_sessions(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SessionMeta>, CommandError> {
+    Ok(session_store::list_sessions(USER, &current_ws(&state).await))
 }
 
 /// The currently-active session's metadata (`None` if none started yet).
@@ -278,7 +297,7 @@ pub async fn current_session(
     let Some(id) = dir.file_name().and_then(|n| n.to_str()).map(String::from) else {
         return Ok(None);
     };
-    Ok(session_store::list_sessions(USER, WORKSHOP)
+    Ok(session_store::list_sessions(USER, &current_ws(&state).await)
         .into_iter()
         .find(|m| m.id == id))
 }
@@ -312,7 +331,9 @@ pub async fn list_members(
         }
         None => Vec::new(),
     };
-    let members = crate::agent::roles::default_workshop()
+    // 成员来自**当前工作室定义**（不再写死 default_workshop）——多工作室下各室成员不同。
+    let members = workshop_store::load_workshop(USER, &current_ws(&state).await)
+        .roles
         .into_iter()
         .map(|role| {
             let (status, status_detail) =
@@ -340,8 +361,10 @@ pub async fn list_members(
 
 /// 当前工作室的完整定义（给编辑器用）。
 #[tauri::command]
-pub async fn get_workshop() -> Result<WorkshopDef, CommandError> {
-    Ok(workshop_store::load_workshop(USER, WORKSHOP))
+pub async fn get_workshop(
+    state: tauri::State<'_, AppState>,
+) -> Result<WorkshopDef, CommandError> {
+    Ok(workshop_store::load_workshop(USER, &current_ws(&state).await))
 }
 
 /// 增/改一个角色（按 id upsert，强制协调者全室唯一），落盘后**热应用**到在跑会话。
@@ -351,9 +374,10 @@ pub async fn save_role(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let mut def = workshop_store::load_workshop(USER, WORKSHOP);
+    let ws = current_ws(&state).await;
+    let mut def = workshop_store::load_workshop(USER, &ws);
     def.upsert_role(role);
-    workshop_store::save_workshop(USER, WORKSHOP, &def)
+    workshop_store::save_workshop(USER, &ws, &def)
         .map_err(|e| CommandError::Llm(LLMError::Other(format!("save role failed: {e}"))))?;
     hot_reload_active_session(app, &state).await?;
     Ok(())
@@ -366,10 +390,11 @@ pub async fn delete_role(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let mut def = workshop_store::load_workshop(USER, WORKSHOP);
+    let ws = current_ws(&state).await;
+    let mut def = workshop_store::load_workshop(USER, &ws);
     def.remove_role(&role_id)
         .map_err(|e| CommandError::Llm(LLMError::Other(e.to_string())))?;
-    workshop_store::save_workshop(USER, WORKSHOP, &def)
+    workshop_store::save_workshop(USER, &ws, &def)
         .map_err(|e| CommandError::Llm(LLMError::Other(format!("delete role failed: {e}"))))?;
     hot_reload_active_session(app, &state).await?;
     Ok(())
@@ -439,10 +464,85 @@ pub async fn model_catalog() -> Result<Vec<String>, CommandError> {
     Ok(vec!["qwen3.6-plus".to_string(), "qwen3.6-flash".to_string()])
 }
 
+// ---------- 工作室生命周期（P3：工作台多工作室）----------
+
+/// 工作台卡片墙：用户的全部工作室。
+#[tauri::command]
+pub async fn list_workshops() -> Result<Vec<WorkshopMeta>, CommandError> {
+    Ok(workshop_store::list_workshops(USER))
+}
+
+/// 当前活跃工作室 id（工作台据此高亮）。
+#[tauri::command]
+pub async fn current_workshop(state: tauri::State<'_, AppState>) -> Result<String, CommandError> {
+    Ok(current_ws(&state).await)
+}
+
+/// 新建工作室（默认三人组做种子）。
+#[tauri::command]
+pub async fn create_workshop(name: String, icon: String) -> Result<WorkshopMeta, CommandError> {
+    workshop_store::create_workshop(USER, &name, &icon)
+        .map_err(|e| CommandError::Llm(LLMError::Other(format!("create workshop failed: {e}"))))
+}
+
+/// 进入某工作室：切活跃工作室 + 停当前会话 + 续接它最近的会话（无则空闲）。
+#[tauri::command]
+pub async fn enter_workshop(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    *state.active_workshop.lock().await = id.clone();
+    *state.session.lock().await = None;
+    *state.active_dir.lock().await = None;
+    resume_workshop_session(app, &state, &id).await?;
+    tracing::info!(target: "aidock::cmd", workshop = %id, "entered workshop");
+    Ok(())
+}
+
+/// 删除工作室（连会话）。删的是当前工作室则切到剩下第一个。
+#[tauri::command]
+pub async fn delete_workshop(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let was_active = current_ws(&state).await == id;
+    if was_active {
+        *state.session.lock().await = None;
+        *state.active_dir.lock().await = None;
+    }
+    workshop_store::delete_workshop(USER, &id)
+        .map_err(|e| CommandError::Llm(LLMError::Other(e)))?;
+    if was_active {
+        if let Some(m) = workshop_store::list_workshops(USER).into_iter().next() {
+            *state.active_workshop.lock().await = m.id.clone();
+            resume_workshop_session(app, &state, &m.id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// 改工作室设置（名称/图标/工作区间）。工作区间非空时校验为存在的目录。
+#[tauri::command]
+pub async fn save_workshop_settings(
+    id: String,
+    name: String,
+    icon: String,
+    workspace_path: String,
+) -> Result<(), CommandError> {
+    workshop_store::update_settings(USER, &id, &name, &icon, &workspace_path)
+        .map_err(|e| CommandError::Llm(LLMError::Other(e)))
+}
+
 /// 重命名会话（写入 meta.json 的 title，覆盖 LLM/派生标题）。
 #[tauri::command]
-pub async fn rename_session(id: String, title: String) -> Result<(), CommandError> {
-    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+pub async fn rename_session(
+    id: String,
+    title: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let dir = session_store::session_dir(USER, &current_ws(&state).await, &id);
     if !dir.is_dir() {
         return Err(CommandError::SessionNotFound(id));
     }
@@ -463,7 +563,8 @@ pub async fn delete_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    let ws = current_ws(&state).await;
+    let dir = session_store::session_dir(USER, &ws, &id);
     if !dir.is_dir() {
         return Err(CommandError::SessionNotFound(id));
     }
@@ -485,14 +586,11 @@ pub async fn delete_session(
         .map_err(|e| CommandError::Llm(LLMError::Other(format!("delete failed: {e}"))))?;
 
     if was_active {
-        let next = session_store::list_sessions(USER, WORKSHOP)
-            .into_iter()
-            .next()
-            .map(|m| session_store::session_dir(USER, WORKSHOP, &m.id))
-            .unwrap_or_else(|| {
-                session_store::session_dir(USER, WORKSHOP, &session_store::new_session_id())
-            });
-        switch_to(app, &state, next).await?;
+        // 切到剩下里最近的；一个都没有就保持无活跃会话（不造幽灵，同 start_session）。
+        if let Some(m) = session_store::list_sessions(USER, &ws).into_iter().next() {
+            let next = session_store::session_dir(USER, &ws, &m.id);
+            switch_to(app, &state, next).await?;
+        }
     }
     Ok(())
 }

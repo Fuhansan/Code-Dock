@@ -12,6 +12,8 @@
     renameSession,
     deleteSession,
     listMembers,
+    listWorkshops,
+    currentWorkshop,
     SESSION_TITLED_EVENT,
     MESSAGE_EVENT,
     TOOL_CALL_EVENT,
@@ -22,6 +24,7 @@
   import ApiKeySetup from '$lib/components/ApiKeySetup.svelte';
   import ChatPanel from '$lib/components/ChatPanel.svelte';
   import WorkshopEditor from '$lib/components/WorkshopEditor.svelte';
+  import WorkbenchView from '$lib/components/WorkbenchView.svelte';
 
   // Sprint 0 health dot + Sprint 1 BYOK gate + chat panel mount.
 
@@ -106,6 +109,7 @@
       activeSessionId = cur?.id ?? '';
       await refreshSessions();
       await refreshMembers();
+      await refreshActiveWorkshop();
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
@@ -249,6 +253,34 @@
 
   let showWorkshopEditor = $state(false);
 
+  // 顶层视图：工作台（管所有工作室）↔ 工作室内（聊天）。
+  let view = $state<'workbench' | 'workshop'>('workshop');
+  let activeWsName = $state('');
+  let activeWsIcon = $state('');
+  async function refreshActiveWorkshop() {
+    try {
+      const [list, cur] = await Promise.all([listWorkshops(), currentWorkshop()]);
+      const w = list.find((x) => x.id === cur);
+      activeWsName = w?.name ?? '';
+      activeWsIcon = w?.icon ?? '';
+    } catch {
+      /* 非致命 */
+    }
+  }
+  // 从工作台进入某工作室 → 切回聊天并按新工作室重载。
+  async function handleEnterWorkshop(_id: string) {
+    view = 'workshop';
+    try {
+      const cur = await currentSession();
+      activeSessionId = cur?.id ?? '';
+      await refreshSessions();
+      await refreshMembers();
+      await refreshActiveWorkshop();
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   let members = $state<MemberInfo[]>([]);
   async function refreshMembers() {
     try {
@@ -269,6 +301,9 @@
   const readyPct = $derived(members.length ? Math.round((readyCount / members.length) * 100) : 0);
 </script>
 
+{#if view === 'workbench'}
+  <WorkbenchView onEnter={handleEnterWorkshop} />
+{:else}
 <div class="app">
   <header class="topbar">
     <div class="brand">
@@ -293,9 +328,10 @@
     <nav class="rail-nav">
       <section class="rail-sec">
         <h3 class="rail-title">我的工作室</h3>
-        <button class="rail-item active">
-          <span class="rail-ico grad">▦</span>
-          <span class="rail-label">软件开发轻量版</span>
+        <button class="rail-item active" onclick={() => (view = 'workbench')} title="返回工作台 · 管理工作室">
+          <span class="rail-ico grad">{activeWsIcon || '▦'}</span>
+          <span class="rail-label">{activeWsName || '工作室'}</span>
+          <span class="rail-chev">⇄</span>
         </button>
       </section>
 
@@ -431,10 +467,6 @@
   </aside>
 </div>
 
-{#if keyConfigured === false}
-  <ApiKeySetup onSaved={handleKeySaved} />
-{/if}
-
 {#if showWorkshopEditor}
   <WorkshopEditor onClose={() => (showWorkshopEditor = false)} onChanged={refreshMembers} />
 {/if}
@@ -478,6 +510,11 @@
 
 {#if toast}
   <div class="toast">{toast}</div>
+{/if}
+{/if}
+
+{#if keyConfigured === false}
+  <ApiKeySetup onSaved={handleKeySaved} />
 {/if}
 
 <style>
@@ -661,6 +698,12 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .rail-chev {
+    margin-left: auto;
+    color: var(--faint);
+    font-size: 12px;
+    flex: none;
   }
   .rail-ico {
     width: 28px;
