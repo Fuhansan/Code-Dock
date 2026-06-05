@@ -67,6 +67,16 @@
   let { sessionId = '' }: { sessionId?: string } = $props();
   const ready = $derived(!!sessionId);
 
+  // 空状态的建议卡：点一下把需求填进输入框。
+  const SUGGESTIONS = [
+    { glyph: '✦', tint: '#efeaff', l1: '帮我生成一个', l2: '项目架构图', prompt: '帮我生成一个项目架构图' },
+    { glyph: '</>', tint: '#e8f0ff', l1: '实现一个', l2: '登录页面', prompt: '实现一个登录页面' },
+    { glyph: '📋', tint: '#e6f7ee', l1: '梳理一下', l2: '产品需求文档', prompt: '梳理一下产品需求文档' }
+  ];
+  function useSuggestion(p: string) {
+    input = p;
+  }
+
   // Sprint 2.6: topic_id → human title. Populated as we see opens_topic_title
   // on incoming messages. Used for SUMMARY divider headings + topic break
   // labels in the stream.
@@ -472,9 +482,31 @@
 
   <div class="chat-area" bind:this={scrollRef}>
     {#if timeline.length === 0 && ready}
-      <div class="empty">
-        <p>多 Agent 工作室已就绪</p>
-        <p class="muted">默认成员：PM、前端、后端 · 输入一条需求开始</p>
+      <div class="hero">
+        <div class="mascot" aria-hidden="true">
+          <span class="blob"></span>
+          <svg class="face" viewBox="0 0 60 60" width="60" height="60">
+            <ellipse cx="24" cy="30" rx="3.2" ry="4.4" fill="#2b2f45" />
+            <ellipse cx="38" cy="30" rx="3.2" ry="4.4" fill="#2b2f45" />
+          </svg>
+          <span class="spark s1">✦</span>
+          <span class="spark s2">✦</span>
+          <span class="spark s3">✧</span>
+        </div>
+        <h2 class="hero-title">多 <span class="grad">Agent</span> 工作室已就绪</h2>
+        <p class="hero-sub">默认成员：PM、前端、后端 · 输入一条需求开始</p>
+        <div class="suggests">
+          {#each SUGGESTIONS as sg (sg.l2)}
+            <button class="suggest" onclick={() => useSuggestion(sg.prompt)}>
+              <span class="suggest-ico" style="background:{sg.tint}">{sg.glyph}</span>
+              <span class="suggest-text">
+                <small>{sg.l1}</small>
+                <strong>{sg.l2}</strong>
+              </span>
+              <span class="suggest-chev">›</span>
+            </button>
+          {/each}
+        </div>
       </div>
     {/if}
 
@@ -578,16 +610,29 @@
   </div>
 
   <div class="input-area">
-    <textarea
-      class="input"
-      placeholder={ready ? '提一个需求 — 例如「做一个简单的 todo Web 应用」…' : '会话启动中…'}
-      bind:value={input}
-      onkeydown={handleKeydown}
-      disabled={sending || !ready}
-    ></textarea>
-    <button class="send" onclick={handleSend} disabled={sending || !ready || !input.trim()}>
-      {sending ? '发送中…' : '发送'}
-    </button>
+    <div class="composer">
+      <textarea
+        class="composer-input"
+        placeholder={ready ? '提一个需求 — 例如「做一个简单的 todo Web 应用」…' : '会话启动中…'}
+        bind:value={input}
+        onkeydown={handleKeydown}
+        disabled={sending || !ready}
+      ></textarea>
+      <div class="composer-bar">
+        <div class="composer-tools">
+          <button class="tool" title="附件" aria-label="附件" type="button">＋</button>
+          <button class="tool" title="联网" aria-label="联网" type="button">🌐</button>
+          <button class="tool" title="提及成员" aria-label="提及成员" type="button">@</button>
+          <button class="tool" title="增强" aria-label="增强" type="button">✨</button>
+        </div>
+        <div class="composer-send">
+          <span class="kbd">⌘↵</span>
+          <button class="send" onclick={handleSend} disabled={sending || !ready || !input.trim()}>
+            <span class="send-ico">➤</span>{sending ? '发送中…' : '发送'}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -623,13 +668,132 @@
     gap: 12px;
   }
 
-  .empty {
+  .hero {
     margin: auto;
     text-align: center;
-    color: #6e6e73;
+    padding: 16px;
+    max-width: 720px;
+    width: 100%;
   }
-  .empty p {
-    margin: 4px 0;
+  .mascot {
+    position: relative;
+    width: 150px;
+    height: 150px;
+    margin: 0 auto 20px;
+  }
+  .blob {
+    position: absolute;
+    inset: 16px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 38% 30%, #ffffff 0 5%, #d6dcff 20%, #a6b0ff 50%, #c0a7ff 82%);
+    box-shadow: 0 20px 50px rgba(123, 92, 255, 0.3), inset 0 -12px 30px rgba(123, 92, 255, 0.22);
+    animation: float 5s ease-in-out infinite;
+  }
+  .face {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    animation: float 5s ease-in-out infinite;
+  }
+  @keyframes float {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-6px);
+    }
+  }
+  .spark {
+    position: absolute;
+    color: #b9a7ff;
+    font-size: 14px;
+  }
+  .spark.s1 {
+    top: 6px;
+    right: 22px;
+    font-size: 18px;
+  }
+  .spark.s2 {
+    bottom: 16px;
+    left: 12px;
+  }
+  .spark.s3 {
+    top: 34px;
+    left: 4px;
+    color: #9fb0ff;
+  }
+  .hero-title {
+    font-size: 26px;
+    font-weight: 700;
+    margin: 0 0 8px;
+    letter-spacing: -0.01em;
+  }
+  .hero-title .grad {
+    background: linear-gradient(90deg, var(--brand1, #7b5cff), var(--brand2, #5b8cff));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .hero-sub {
+    color: #8a8fa3;
+    font-size: 13.5px;
+    margin: 0 0 26px;
+  }
+  .suggests {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .suggest {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-align: left;
+    cursor: pointer;
+    background: #fff;
+    border: 1px solid #ededf2;
+    border-radius: 14px;
+    padding: 13px;
+    font: inherit;
+    box-shadow: 0 1px 2px rgba(28, 30, 60, 0.05);
+    transition:
+      transform 0.12s,
+      box-shadow 0.12s,
+      border-color 0.12s;
+  }
+  .suggest:hover {
+    transform: translateY(-2px);
+    border-color: #ddd6ff;
+    box-shadow: 0 8px 22px rgba(28, 30, 60, 0.08);
+  }
+  .suggest-ico {
+    width: 32px;
+    height: 32px;
+    flex: none;
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    font-size: 14px;
+    color: #6b54ec;
+  }
+  .suggest-text {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.3;
+    flex: 1;
+    min-width: 0;
+  }
+  .suggest-text small {
+    font-size: 11.5px;
+    color: #8a8fa3;
+  }
+  .suggest-text strong {
+    font-size: 13.5px;
+  }
+  .suggest-chev {
+    color: #c2c6d4;
+    font-size: 16px;
   }
   .muted {
     color: #8e8e93;
@@ -1020,52 +1184,109 @@
   }
 
   .input-area {
-    border-top: 1px solid #e5e5e7;
-    padding: 12px 16px;
-    background: #ffffff;
-    display: flex;
-    gap: 8px;
-    align-items: flex-end;
+    padding: 0 22px 20px;
+    background: transparent;
   }
-
-  .input {
-    flex: 1;
-    min-height: 56px;
+  .composer {
+    border: 1px solid #e7e8ef;
+    border-radius: 18px;
+    background: #fff;
+    box-shadow: 0 2px 10px rgba(28, 30, 60, 0.05);
+    transition:
+      border-color 0.15s,
+      box-shadow 0.15s;
+  }
+  .composer:focus-within {
+    border-color: #c9bdff;
+    box-shadow: 0 4px 18px rgba(123, 92, 255, 0.12);
+  }
+  .composer-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 52px;
     max-height: 200px;
-    border: 1px solid #e5e5e7;
-    border-radius: 8px;
-    padding: 10px 12px;
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
     font-family: inherit;
     font-size: 14px;
-    resize: none;
-    outline: none;
-    background: #fafafa;
-    box-sizing: border-box;
-    transition: border-color 0.15s;
+    line-height: 1.5;
+    color: var(--ink, #1e2233);
+    padding: 14px 16px 4px;
   }
-  .input:focus {
-    border-color: #007aff;
-    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.12);
+  .composer-input::placeholder {
+    color: #aeb2c4;
   }
-
-  .send {
-    background: #007aff;
-    color: #ffffff;
+  .composer-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 10px 8px;
+  }
+  .composer-tools {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .tool {
+    width: 34px;
+    height: 34px;
     border: none;
-    border-radius: 8px;
-    padding: 0 18px;
-    height: 36px;
-    font-size: 14px;
-    font-weight: 500;
+    background: transparent;
+    border-radius: 9px;
     cursor: pointer;
-    transition: background 0.15s;
-    white-space: nowrap;
+    font-size: 15px;
+    color: #8a8fa3;
+  }
+  .tool:hover {
+    background: #f1f2f6;
+    color: #6b54ec;
+  }
+  .composer-send {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .kbd {
+    font-size: 11px;
+    color: #aeb2c4;
+    background: #f3f4f8;
+    border: 1px solid #e7e8ef;
+    border-radius: 6px;
+    padding: 2px 6px;
+  }
+  .send {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    cursor: pointer;
+    color: #fff;
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 600;
+    border-radius: 11px;
+    padding: 8px 16px;
+    background: linear-gradient(135deg, var(--brand1, #7b5cff), var(--brand2, #5b8cff));
+    box-shadow: 0 6px 16px rgba(123, 92, 255, 0.3);
+    transition:
+      filter 0.15s,
+      transform 0.1s;
+  }
+  .send-ico {
+    font-size: 12px;
   }
   .send:hover:not(:disabled) {
-    background: #0066d6;
+    filter: brightness(1.05);
+  }
+  .send:active:not(:disabled) {
+    transform: translateY(1px);
   }
   .send:disabled {
-    background: #c7c7cc;
+    background: #d3d5df;
+    box-shadow: none;
     cursor: not-allowed;
   }
 
@@ -1082,9 +1303,6 @@
       color: #ff6961;
       border-color: #5a2926;
     }
-    .empty {
-      color: #98989d;
-    }
     .muted {
       color: #8e8e93;
     }
@@ -1099,15 +1317,6 @@
     }
     .info-text {
       color: #98989d;
-    }
-    .input-area {
-      background: #2c2c2e;
-      border-top-color: #38383a;
-    }
-    .input {
-      background: #1c1c1e;
-      border-color: #38383a;
-      color: #f5f5f7;
     }
     .divider hr {
       border-top-color: #48484a;

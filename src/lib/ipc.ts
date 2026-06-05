@@ -226,3 +226,11 @@ export function listSessions(): Promise<SessionMeta[]> {
 export function currentSession(): Promise<SessionMeta | null> {
   return invoke('current_session');
 }
+
+/** Emitted when a session's LLM-generated title is ready (after its first
+ *  message). Frontend updates its session list on receipt. */
+export const SESSION_TITLED_EVENT = 'aidock:session_titled';
+export interface SessionTitled {
+  id: string;
+  title: string;
+}

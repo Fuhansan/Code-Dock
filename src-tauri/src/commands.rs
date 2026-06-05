@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use serde_json::Value as JsonValue;
+use tauri::Emitter;
 use tokio::sync::Mutex;
 
 use crate::agent::approval::{new_pending_approvals, ApprovalRegistry, Decision, PendingApprovals};
@@ -269,15 +270,99 @@ pub async fn session_status(state: tauri::State<'_, AppState>) -> Result<bool, C
 
 /// Push one user-originated message into the running session. Errors if no
 /// session has been started.
+/// Tauri event emitted when a session's LLM-generated title is ready, so the
+/// frontend can update its session list without re-polling.
+pub const SESSION_TITLED_EVENT: &str = "aidock:session_titled";
+
+#[derive(Clone, serde::Serialize)]
+struct SessionTitled {
+    id: String,
+    title: String,
+}
+
+/// One-shot LLM call: condense the user's first message into a short session
+/// title (intent, not the raw message). Best-effort — `None` on any failure, in
+/// which case the list keeps the truncated-first-message fallback.
+async fn generate_session_title(first_message: &str, key: &str) -> Option<String> {
+    let req = ChatRequest {
+        model: "qwen3.6-plus".to_string(),
+        messages: vec![
+            ChatMessage::System {
+                content: "你是会话标题生成器。根据用户的第一条需求，用一个不超过 12 个汉字的\
+                          简短中文短语概括其意图，作为会话标题。只输出标题本身，不要引号、标点、\
+                          解释或任何前后缀。"
+                    .to_string(),
+            },
+            ChatMessage::User {
+                content: first_message.chars().take(500).collect(),
+            },
+        ],
+        temperature: Some(0.2),
+        max_tokens: Some(32),
+        tools: Vec::new(),
+        tool_choice: None,
+    };
+    let resp = BailianProvider::new(key.to_string())
+        .chat_completion(req)
+        .await
+        .ok()?;
+    let title: String = resp
+        .content?
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '「' | '」' | '“' | '”' | '：' | ':'))
+        .trim()
+        .chars()
+        .take(24)
+        .collect();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+/// Push one user-originated message into the running session. On the FIRST
+/// message of a session, kick off an LLM title generation in the background
+/// (non-blocking) and emit `SESSION_TITLED_EVENT` when it's ready.
 #[tauri::command]
 pub async fn send_user_message(
     content: String,
     topic_id: Option<String>,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let guard = state.session.lock().await;
-    let session = guard.as_ref().ok_or(CommandError::NoActiveSession)?;
-    session.submit_user_input(content, topic_id).await?;
+    let dir = state.active_dir.lock().await.clone();
+    // 发之前会话是否还空 → 这条是不是首条（只在首条触发起标题）。
+    let should_title = dir
+        .as_ref()
+        .map(|d| session_store::is_empty_session(d))
+        .unwrap_or(false);
+
+    {
+        let guard = state.session.lock().await;
+        let session = guard.as_ref().ok_or(CommandError::NoActiveSession)?;
+        session.submit_user_input(content.clone(), topic_id).await?;
+    }
+
+    if should_title {
+        if let Some(dir) = dir {
+            let id = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                let Ok(Some(key)) = keyring_store::load_api_key("bailian") else {
+                    return;
+                };
+                if let Some(title) = generate_session_title(&content, &key).await {
+                    if session_store::write_title(&dir, &title).is_ok() {
+                        let _ = app.emit(SESSION_TITLED_EVENT, SessionTitled { id, title });
+                    }
+                }
+            });
+        }
+    }
     Ok(())
 }
 

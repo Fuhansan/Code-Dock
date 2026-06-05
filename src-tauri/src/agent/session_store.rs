@@ -93,7 +93,9 @@ pub fn list_sessions(user: &str, workshop: &str) -> Vec<SessionMeta> {
 fn meta_for(dir: &Path, id: String) -> SessionMeta {
     let created_ms = created_from_id(&id);
     let msgs = dir.join("messages.jsonl");
-    let (title, message_count) = title_and_count(&msgs);
+    let (derived_title, message_count) = title_and_count(&msgs);
+    // LLM 生成的标题(meta.json)优先;否则回落"截取首条用户消息"。
+    let title = read_title(dir).unwrap_or(derived_title);
     let last_active_ms = mtime_ms(&msgs).unwrap_or(created_ms);
     SessionMeta {
         id,
@@ -101,6 +103,33 @@ fn meta_for(dir: &Path, id: String) -> SessionMeta {
         created_ms,
         last_active_ms,
         message_count,
+    }
+}
+
+/// 持久化的会话标题(LLM 按意图生成)存在 `{dir}/meta.json` 的 `title` 字段。
+/// 有则优先于"截首条消息"的回落标题。
+pub fn read_title(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let t = v.get("title")?.as_str()?.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// 写入(覆盖)会话标题到 `meta.json`。
+pub fn write_title(dir: &Path, title: &str) -> std::io::Result<()> {
+    let body = serde_json::json!({ "title": title }).to_string();
+    std::fs::write(dir.join("meta.json"), body)
+}
+
+/// True iff 该会话还没有任何消息(下一条用户消息即首条——用于"首条触发起标题")。
+pub fn is_empty_session(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join("messages.jsonl")) {
+        Ok(c) => c.lines().all(|l| l.trim().is_empty()),
+        Err(_) => true,
     }
 }
 
@@ -229,5 +258,32 @@ mod tests {
         let t = truncate(&long, TITLE_MAX);
         assert_eq!(t.chars().count(), TITLE_MAX + 1); // +1 for the ellipsis
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn meta_title_overrides_derived() {
+        let (dir, user, ws) = tmp_sessions();
+        let s = "3000_cccccccc".to_string();
+        let sd = dir.join(&s);
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(
+            sd.join("messages.jsonl"),
+            "{\"sender\":\"user\",\"timestamp\":1,\"kind\":{\"type\":\"USER_INPUT\",\"content\":\"原始首条消息\"}}\n",
+        )
+        .unwrap();
+        let title_of = |id: &str| {
+            list_sessions(&user, &ws)
+                .into_iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .title
+        };
+        // No meta yet → derived from first message.
+        assert_eq!(title_of(&s), "原始首条消息");
+        assert!(!is_empty_session(&sd));
+        // LLM-written meta title overrides.
+        write_title(&sd, "登录页开发").unwrap();
+        assert_eq!(read_title(&sd).as_deref(), Some("登录页开发"));
+        assert_eq!(title_of(&s), "登录页开发");
     }
 }
