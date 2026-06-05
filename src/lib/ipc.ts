@@ -227,6 +227,17 @@ export function currentSession(): Promise<SessionMeta | null> {
   return invoke('current_session');
 }
 
+/** Rename a session (sets a custom title, overriding the LLM/derived one). */
+export function renameSession(id: string, title: string): Promise<void> {
+  return invoke('rename_session', { id, title });
+}
+
+/** Delete a session (and its data). If it was active, the backend switches to
+ *  the most-recent remaining session (or creates a fresh one). */
+export function deleteSession(id: string): Promise<void> {
+  return invoke('delete_session', { id });
+}
+
 /** Emitted when a session's LLM-generated title is ready (after its first
  *  message). Frontend updates its session list on receipt. */
 export const SESSION_TITLED_EVENT = 'aidock:session_titled';

@@ -45,6 +45,8 @@ pub fn run() {
             commands::resume_session,
             commands::list_sessions,
             commands::current_session,
+            commands::rename_session,
+            commands::delete_session,
             commands::session_status,
             commands::send_user_message,
             commands::load_message_history,

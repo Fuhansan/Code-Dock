@@ -179,10 +179,13 @@ async fn switch_to(
     Ok(())
 }
 
-/// Launch entrypoint (idempotent): if a session is already running, no-op;
-/// otherwise **resume the most-recently-active** session, or create a fresh one
-/// if there are none. (Continuing a past session = `Session::start` rehydrating
-/// its dir — history, agent state, scratchpad, ④.b memory all come back.)
+/// Launch entrypoint (idempotent): if a session is already running, no-op.
+/// Otherwise **resume the most-recently-active non-empty session**. Crucially it
+/// does NOT auto-create a session when there are none — that's what produced a
+/// phantom "新会话" in the list on every startup. Instead it first prunes any
+/// leftover empty sessions (a 新建 that was never used) and, if nothing remains,
+/// leaves the app with no active session: the UI shows the empty state and the
+/// user starts one explicitly via 新建. A new session must be a deliberate act.
 #[tauri::command]
 pub async fn start_session(
     app: tauri::AppHandle,
@@ -192,12 +195,24 @@ pub async fn start_session(
         tracing::debug!(target: "aidock::cmd", "start_session: already running");
         return Ok(());
     }
-    let dir = match session_store::list_sessions(USER, WORKSHOP).into_iter().next() {
-        Some(meta) => session_store::session_dir(USER, WORKSHOP, &meta.id),
-        None => session_store::session_dir(USER, WORKSHOP, &session_store::new_session_id()),
-    };
-    switch_to(app, &state, dir).await?;
-    tracing::info!(target: "aidock::cmd", "session started (resume-most-recent-or-new)");
+    // 清掉残留空会话（新建后没发过消息的）——它们不该作为幽灵留到下次启动。
+    for meta in session_store::list_sessions(USER, WORKSHOP) {
+        let d = session_store::session_dir(USER, WORKSHOP, &meta.id);
+        if session_store::is_empty_session(&d) {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+    // 续接剩下里最近的真会话；一个都没有就**不造**，保持无活跃会话。
+    match session_store::list_sessions(USER, WORKSHOP).into_iter().next() {
+        Some(meta) => {
+            let dir = session_store::session_dir(USER, WORKSHOP, &meta.id);
+            switch_to(app, &state, dir).await?;
+            tracing::info!(target: "aidock::cmd", "session resumed (most-recent non-empty)");
+        }
+        None => {
+            tracing::info!(target: "aidock::cmd", "no sessions; idle until 新建/first message");
+        }
+    }
     Ok(())
 }
 
@@ -262,6 +277,66 @@ pub async fn current_session(
         .find(|m| m.id == id))
 }
 
+/// 重命名会话（写入 meta.json 的 title，覆盖 LLM/派生标题）。
+#[tauri::command]
+pub async fn rename_session(id: String, title: String) -> Result<(), CommandError> {
+    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    if !dir.is_dir() {
+        return Err(CommandError::SessionNotFound(id));
+    }
+    let t = title.trim();
+    if t.is_empty() {
+        return Ok(()); // 空标题忽略（回落派生标题）
+    }
+    session_store::write_title(&dir, t)
+        .map_err(|e| CommandError::Llm(LLMError::Other(format!("rename failed: {e}"))))?;
+    Ok(())
+}
+
+/// 删除会话（连目录一起删）。若删的是当前活跃会话，先停掉它再删，然后切到剩下里
+/// 最近的一个（没有就新建一个），保证 app 始终有个活跃会话。
+#[tauri::command]
+pub async fn delete_session(
+    id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), CommandError> {
+    let dir = session_store::session_dir(USER, WORKSHOP, &id);
+    if !dir.is_dir() {
+        return Err(CommandError::SessionNotFound(id));
+    }
+    let was_active = state
+        .active_dir
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|d| d.file_name().and_then(|n| n.to_str()))
+        .map(|n| n == id)
+        .unwrap_or(false);
+
+    if was_active {
+        // 停掉正在用它的 Session，再删它的目录。
+        *state.session.lock().await = None;
+        *state.active_dir.lock().await = None;
+    }
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| CommandError::Llm(LLMError::Other(format!("delete failed: {e}"))))?;
+
+    if was_active {
+        let next = session_store::list_sessions(USER, WORKSHOP)
+            .into_iter()
+            .next()
+            .map(|m| session_store::session_dir(USER, WORKSHOP, &m.id))
+            .unwrap_or_else(|| {
+                session_store::session_dir(USER, WORKSHOP, &session_store::new_session_id())
+            });
+        switch_to(app, &state, next).await?;
+    }
+    Ok(())
+}
+
+// 分享：先不实现（用户要求）。未来可在此加 export/share 命令。
+
 /// Whether a session is currently running.
 #[tauri::command]
 pub async fn session_status(state: tauri::State<'_, AppState>) -> Result<bool, CommandError> {
@@ -285,7 +360,8 @@ struct SessionTitled {
 /// which case the list keeps the truncated-first-message fallback.
 async fn generate_session_title(first_message: &str, key: &str) -> Option<String> {
     let req = ChatRequest {
-        model: "qwen3.6-plus".to_string(),
+        // 标题是轻活：用轻量级 flash 模型，比 agent 用的 plus 快得多（避免标题比正文还慢）。
+        model: "qwen3.6-flash".to_string(),
         messages: vec![
             ChatMessage::System {
                 content: "你是会话标题生成器。根据用户的第一条需求，用一个不超过 12 个汉字的\
@@ -352,14 +428,16 @@ pub async fn send_user_message(
                 .map(String::from)
                 .unwrap_or_default();
             tokio::spawn(async move {
-                let Ok(Some(key)) = keyring_store::load_api_key("bailian") else {
-                    return;
-                };
-                if let Some(title) = generate_session_title(&content, &key).await {
-                    if session_store::write_title(&dir, &title).is_ok() {
-                        let _ = app.emit(SESSION_TITLED_EVENT, SessionTitled { id, title });
+                // 试着用 LLM 起标题；不论成功与否都发事件，让前端首条消息后刷新列表
+                // （这个会话从"空(不显示)"变成"有内容(该显示)"）。
+                let mut title = String::new();
+                if let Ok(Some(key)) = keyring_store::load_api_key("bailian") {
+                    if let Some(t) = generate_session_title(&content, &key).await {
+                        let _ = session_store::write_title(&dir, &t);
+                        title = t;
                     }
                 }
+                let _ = app.emit(SESSION_TITLED_EVENT, SessionTitled { id, title });
             });
         }
     }

@@ -9,7 +9,11 @@
     listSessions,
     newSession,
     resumeSession,
+    renameSession,
+    deleteSession,
     SESSION_TITLED_EVENT,
+    MESSAGE_EVENT,
+    TOOL_CALL_EVENT,
     type SessionMeta,
     type SessionTitled
   } from '$lib/ipc';
@@ -40,16 +44,38 @@
     await refreshKeyStatus();
     if (keyConfigured) await initSession();
 
-    // 会话标题就绪(首条消息后 LLM 生成) → 刷新列表显示新标题。
-    unlistenTitle = await listen<SessionTitled>(SESSION_TITLED_EVENT, (e) => {
-      const { id, title } = e.payload;
-      sessions = sessions.map((s) => (s.id === id ? { ...s, title } : s));
+    // 首条消息后：该会话从空变成有内容、标题就绪 → 重拉列表（拿到标题 + 让它进列表）。
+    unlistenTitle = await listen<SessionTitled>(SESSION_TITLED_EVENT, () => {
+      refreshSessions();
     });
+
+    // 思考动画：活跃会话只要有内部活动(消息/工具调用)就在左栏点亮"…"，
+    // 静默 ~4s 后熄灭。纯 UI 指示，不回灌任何上下文。
+    unlistenMsg = await listen(MESSAGE_EVENT, () => bumpThinking());
+    unlistenTool = await listen(TOOL_CALL_EVENT, () => bumpThinking());
   });
 
+  // ---- 思考动画状态 ----
+  let thinkingSessionId = $state<string | null>(null);
+  let thinkTimer: ReturnType<typeof setTimeout> | null = null;
+  function bumpThinking() {
+    if (!activeSessionId) return;
+    thinkingSessionId = activeSessionId;
+    if (thinkTimer) clearTimeout(thinkTimer);
+    thinkTimer = setTimeout(() => {
+      thinkingSessionId = null;
+      thinkTimer = null;
+    }, 4000);
+  }
+
   let unlistenTitle: UnlistenFn | null = null;
+  let unlistenMsg: UnlistenFn | null = null;
+  let unlistenTool: UnlistenFn | null = null;
   onDestroy(() => {
     if (unlistenTitle) unlistenTitle();
+    if (unlistenMsg) unlistenMsg();
+    if (unlistenTool) unlistenTool();
+    if (thinkTimer) clearTimeout(thinkTimer);
   });
 
   async function refreshKeyStatus() {
@@ -112,6 +138,83 @@
     } catch (e) {
       sessionError = e instanceof Error ? e.message : String(e);
     }
+  }
+
+  // ---- 会话项操作菜单（... → 分享/重命名/删除）----
+  let openMenuId = $state<string | null>(null);
+  let menuX = $state(0);
+  let menuY = $state(0);
+  let renamingId = $state<string | null>(null);
+  let renameValue = $state('');
+  let toast = $state('');
+
+  function openMenu(e: MouseEvent, id: string) {
+    e.stopPropagation();
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    menuX = r.left;
+    menuY = r.bottom + 6;
+    openMenuId = id;
+  }
+  function closeMenu() {
+    openMenuId = null;
+  }
+  function flashToast(msg: string) {
+    toast = msg;
+    setTimeout(() => (toast = ''), 2200);
+  }
+
+  // 分享：占位，功能后续实现。
+  function onShareSession() {
+    closeMenu();
+    flashToast('分享功能即将上线');
+  }
+
+  function startRename(id: string) {
+    renameValue = sessions.find((s) => s.id === id)?.title ?? '';
+    renamingId = id;
+    closeMenu();
+  }
+  function cancelRename() {
+    renamingId = null;
+  }
+  async function commitRename(id: string) {
+    const t = renameValue.trim();
+    renamingId = null;
+    if (!t) return;
+    try {
+      await renameSession(id, t);
+      sessions = sessions.map((s) => (s.id === id ? { ...s, title: t } : s));
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // 删除走应用内确认弹窗（Tauri webview 里 window.confirm 不可靠/是 no-op，会直接
+  // 跳过删除——所以自己做确认 UI）。
+  let confirmDeleteId = $state<string | null>(null);
+  function onDeleteSession(id: string) {
+    closeMenu();
+    confirmDeleteId = id;
+  }
+  async function confirmDelete() {
+    const id = confirmDeleteId;
+    confirmDeleteId = null;
+    if (!id) return;
+    try {
+      await deleteSession(id);
+      // 后端可能已切换活跃会话（删的是当前那个）——重新同步。
+      const cur = await currentSession();
+      activeSessionId = cur?.id ?? '';
+      await refreshSessions();
+    } catch (e) {
+      sessionError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // 重命名输入框自动聚焦 + 选中。
+  function focusSelect(node: HTMLInputElement) {
+    node.focus();
+    node.select();
   }
 
   // 工作室成员面板。V0.1 静态：6 个角色原型——本工作室在用的 3 个(PM/前端/后端)=
@@ -178,16 +281,39 @@
         </div>
         <ul class="rail-list">
           {#each sessions as s (s.id)}
-            <li>
-              <button
-                class="rail-item session"
-                class:active={s.id === activeSessionId}
-                onclick={() => onSwitchSession(s.id)}
-                title={s.title}
-              >
-                <span class="rail-ico chat">💬</span>
-                <span class="rail-label">{s.title}</span>
-              </button>
+            <li class="session-li">
+              {#if renamingId === s.id}
+                <input
+                  class="rename-input"
+                  bind:value={renameValue}
+                  use:focusSelect
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter') commitRename(s.id);
+                    else if (e.key === 'Escape') cancelRename();
+                  }}
+                  onblur={() => commitRename(s.id)}
+                />
+              {:else}
+                <button
+                  class="rail-item session"
+                  class:active={s.id === activeSessionId}
+                  onclick={() => onSwitchSession(s.id)}
+                  title={s.title}
+                >
+                  <span class="rail-ico chat">💬</span>
+                  <span class="rail-label">{s.title}</span>
+                  {#if s.id === thinkingSessionId}
+                    <span class="thinking-dots" aria-label="思考中"><i></i><i></i><i></i></span>
+                  {/if}
+                </button>
+                <button
+                  class="dots"
+                  class:open={openMenuId === s.id}
+                  onclick={(e) => openMenu(e, s.id)}
+                  aria-label="会话操作"
+                  title="更多"
+                >⋯</button>
+              {/if}
             </li>
           {/each}
           {#if sessions.length === 0}
@@ -275,6 +401,47 @@
 
 {#if keyConfigured === false}
   <ApiKeySetup onSaved={handleKeySaved} />
+{/if}
+
+{#if openMenuId}
+  <div class="menu-overlay" onclick={closeMenu} role="presentation"></div>
+  <div class="session-menu" style="left:{menuX}px; top:{menuY}px">
+    <button class="menu-item" onclick={() => onShareSession()}>
+      <svg class="mi-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 2 11 13" /><path d="M22 2 15 22l-4-9-9-4 20-7z" />
+      </svg>
+      <span class="mi-label">分享</span>
+    </button>
+    <button class="menu-item" onclick={() => startRename(openMenuId!)}>
+      <svg class="mi-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+      </svg>
+      <span class="mi-label">重命名</span>
+    </button>
+    <div class="menu-sep"></div>
+    <button class="menu-item danger" onclick={() => onDeleteSession(openMenuId!)}>
+      <svg class="mi-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M10 11v6M14 11v6" />
+      </svg>
+      <span class="mi-label">删除</span>
+    </button>
+  </div>
+{/if}
+
+{#if confirmDeleteId}
+  <div class="confirm-overlay" onclick={() => (confirmDeleteId = null)} role="presentation"></div>
+  <div class="confirm-modal">
+    <h4 class="confirm-title">删除这个会话？</h4>
+    <p class="confirm-text">此操作不可恢复，该会话的对话与记忆都会被删除。</p>
+    <div class="confirm-actions">
+      <button class="cbtn ghost" onclick={() => (confirmDeleteId = null)}>取消</button>
+      <button class="cbtn danger" onclick={confirmDelete}>删除</button>
+    </div>
+  </div>
+{/if}
+
+{#if toast}
+  <div class="toast">{toast}</div>
 {/if}
 
 <style>
@@ -483,6 +650,215 @@
     color: var(--faint);
     font-size: 12.5px;
     padding: 6px 10px;
+  }
+
+  /* 思考动画（活跃会话内部活动时左栏点亮的"…"） */
+  .thinking-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: none;
+    margin-left: 6px;
+  }
+  .thinking-dots i {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--brand1);
+    display: block;
+    animation: think 1.2s infinite ease-in-out both;
+  }
+  .thinking-dots i:nth-child(2) {
+    animation-delay: 0.18s;
+  }
+  .thinking-dots i:nth-child(3) {
+    animation-delay: 0.36s;
+  }
+  @keyframes think {
+    0%,
+    80%,
+    100% {
+      opacity: 0.25;
+      transform: translateY(0);
+    }
+    40% {
+      opacity: 1;
+      transform: translateY(-2px);
+    }
+  }
+
+  /* 会话项操作 ... + 内联重命名 + 下拉菜单 */
+  .session-li {
+    position: relative;
+  }
+  .session-li .session {
+    padding-right: 30px;
+  }
+  .dots {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 24px;
+    height: 24px;
+    border: none;
+    background: transparent;
+    border-radius: 7px;
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 17px;
+    line-height: 1;
+    opacity: 0;
+    transition:
+      opacity 0.12s,
+      background 0.12s;
+  }
+  .session-li:hover .dots,
+  .dots.open {
+    opacity: 1;
+  }
+  .dots:hover {
+    background: #e1e2ea;
+  }
+  .rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--brand1);
+    border-radius: var(--radius-sm);
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 13.5px;
+    outline: none;
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(123, 92, 255, 0.12);
+  }
+  .menu-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+  }
+  .session-menu {
+    position: fixed;
+    z-index: 41;
+    min-width: 244px;
+    background: #fff;
+    border: 1px solid #eef0f4;
+    border-radius: 18px;
+    box-shadow:
+      0 20px 50px rgba(28, 30, 60, 0.18),
+      0 2px 8px rgba(28, 30, 60, 0.06);
+    padding: 8px;
+  }
+  .menu-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    border: none;
+    background: transparent;
+    border-radius: 12px;
+    padding: 12px 14px;
+    font: inherit;
+    font-size: 15px;
+    color: #2b2f45;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.12s;
+  }
+  .menu-item:hover {
+    background: var(--brand-soft);
+  }
+  .mi-ico {
+    width: 20px;
+    height: 20px;
+    flex: none;
+    color: var(--brand-ink);
+  }
+  .mi-label {
+    flex: 1;
+  }
+  .menu-item.danger {
+    color: #ef4444;
+  }
+  .menu-item.danger .mi-ico {
+    color: #ef4444;
+  }
+  .menu-item.danger:hover {
+    background: #fdeceb;
+  }
+  .menu-sep {
+    height: 1px;
+    background: #eef0f4;
+    margin: 8px 12px;
+  }
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 65;
+    background: rgba(20, 22, 40, 0.28);
+  }
+  .confirm-modal {
+    position: fixed;
+    z-index: 66;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 320px;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(28, 30, 60, 0.25);
+    padding: 22px;
+  }
+  .confirm-title {
+    margin: 0 0 8px;
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .confirm-text {
+    margin: 0 0 18px;
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  .cbtn {
+    border: none;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13.5px;
+    border-radius: 10px;
+    padding: 8px 16px;
+  }
+  .cbtn.ghost {
+    background: #f1f2f6;
+    color: var(--ink);
+  }
+  .cbtn.ghost:hover {
+    background: #e7e8ee;
+  }
+  .cbtn.danger {
+    background: #ef4444;
+    color: #fff;
+  }
+  .cbtn.danger:hover {
+    filter: brightness(1.05);
+  }
+  .toast {
+    position: fixed;
+    bottom: 28px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    background: #1e2233;
+    color: #fff;
+    padding: 9px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
   }
 
   .pill {

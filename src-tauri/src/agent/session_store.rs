@@ -223,33 +223,35 @@ mod tests {
     }
 
     #[test]
-    fn list_derives_title_count_and_sorts_by_created() {
+    fn list_shows_all_and_sorts_by_created() {
         let (dir, user, ws) = tmp_sessions();
-        // session 1: has a user message → title from it.
-        let s1 = "1000_aaaaaaaa".to_string();
-        std::fs::create_dir_all(dir.join(&s1)).unwrap();
-        std::fs::write(
-            dir.join(&s1).join("messages.jsonl"),
-            "{\"id\":\"m1\",\"sender\":\"user\",\"timestamp\":1,\"kind\":{\"type\":\"USER_INPUT\",\"content\":\"做一个登录页\"}}\n\
-             {\"id\":\"m2\",\"sender\":\"PM\",\"timestamp\":2,\"kind\":{\"type\":\"BROADCAST\",\"content\":\"收到\"}}\n",
-        )
-        .unwrap();
-        // session 2: empty → "新会话".
-        let s2 = "2000_bbbbbbbb".to_string();
-        std::fs::create_dir_all(dir.join(&s2)).unwrap();
+        let write_msg = |id: &str, content: &str| {
+            std::fs::create_dir_all(dir.join(id)).unwrap();
+            std::fs::write(
+                dir.join(id).join("messages.jsonl"),
+                format!(
+                    "{{\"id\":\"m1\",\"sender\":\"user\",\"timestamp\":1,\"kind\":{{\"type\":\"USER_INPUT\",\"content\":\"{content}\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_msg("1000_aaaaaaaa", "做一个登录页");
+        write_msg("2000_bbbbbbbb", "todo 应用");
+        // 空会话(无消息)也会被列出——惰性创建/新建后要立刻可见。
+        std::fs::create_dir_all(dir.join("3000_dddddddd")).unwrap();
 
         let list = list_sessions(&user, &ws);
-        assert_eq!(list.len(), 2);
-        // Sorted by created (newest first): s2 (created 2000) before s1 (1000).
-        assert_eq!(list[0].id, s2);
-        assert_eq!(list[1].id, s1);
-        let m1 = list.iter().find(|m| m.id == s1).unwrap();
+        assert_eq!(list.len(), 3);
+        // created 倒序：3000、2000、1000。
+        assert_eq!(list[0].id, "3000_dddddddd");
+        assert_eq!(list[1].id, "2000_bbbbbbbb");
+        assert_eq!(list[2].id, "1000_aaaaaaaa");
+        let m_empty = list.iter().find(|m| m.id == "3000_dddddddd").unwrap();
+        assert_eq!(m_empty.title, "新会话");
+        assert_eq!(m_empty.message_count, 0);
+        let m1 = list.iter().find(|m| m.id == "1000_aaaaaaaa").unwrap();
         assert_eq!(m1.title, "做一个登录页");
-        assert_eq!(m1.message_count, 2);
-        assert_eq!(m1.created_ms, 1000);
-        let m2 = list.iter().find(|m| m.id == s2).unwrap();
-        assert_eq!(m2.title, "新会话");
-        assert_eq!(m2.message_count, 0);
+        assert_eq!(m1.message_count, 1);
     }
 
     #[test]

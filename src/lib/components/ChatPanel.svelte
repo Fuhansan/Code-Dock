@@ -443,8 +443,6 @@
     <div class="banner error">
       <strong>启动失败：</strong>{bootError}
     </div>
-  {:else if !ready}
-    <div class="banner muted">正在启动工作室会话…</div>
   {/if}
 
   {#if currentApproval}
@@ -481,7 +479,7 @@
   {/if}
 
   <div class="chat-area" bind:this={scrollRef}>
-    {#if timeline.length === 0 && ready}
+    {#if timeline.length === 0}
       <div class="hero">
         <div class="mascot" aria-hidden="true">
           <span class="blob"></span>
@@ -494,19 +492,23 @@
           <span class="spark s3">✧</span>
         </div>
         <h2 class="hero-title">多 <span class="grad">Agent</span> 工作室已就绪</h2>
-        <p class="hero-sub">默认成员：PM、前端、后端 · 输入一条需求开始</p>
-        <div class="suggests">
-          {#each SUGGESTIONS as sg (sg.l2)}
-            <button class="suggest" onclick={() => useSuggestion(sg.prompt)}>
-              <span class="suggest-ico" style="background:{sg.tint}">{sg.glyph}</span>
-              <span class="suggest-text">
-                <small>{sg.l1}</small>
-                <strong>{sg.l2}</strong>
-              </span>
-              <span class="suggest-chev">›</span>
-            </button>
-          {/each}
-        </div>
+        <p class="hero-sub">
+          {ready ? '默认成员：PM、前端、后端 · 输入一条需求开始' : '点击左侧「＋ 新建」开始一个新会话'}
+        </p>
+        {#if ready}
+          <div class="suggests">
+            {#each SUGGESTIONS as sg (sg.l2)}
+              <button class="suggest" onclick={() => useSuggestion(sg.prompt)}>
+                <span class="suggest-ico" style="background:{sg.tint}">{sg.glyph}</span>
+                <span class="suggest-text">
+                  <small>{sg.l1}</small>
+                  <strong>{sg.l2}</strong>
+                </span>
+                <span class="suggest-chev">›</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/if}
 
@@ -613,7 +615,9 @@
     <div class="composer">
       <textarea
         class="composer-input"
-        placeholder={ready ? '提一个需求 — 例如「做一个简单的 todo Web 应用」…' : '会话启动中…'}
+        placeholder={ready
+          ? '提一个需求 — 例如「做一个简单的 todo Web 应用」…'
+          : '点击左侧「＋ 新建」开始一个会话'}
         bind:value={input}
         onkeydown={handleKeydown}
         disabled={sending || !ready}
@@ -648,10 +652,6 @@
     padding: 8px 14px;
     font-size: 13px;
     border-bottom: 1px solid #e5e5e7;
-  }
-  .banner.muted {
-    background: #f5f5f7;
-    color: #6e6e73;
   }
   .banner.error {
     background: #ffefee;
@@ -794,10 +794,6 @@
   .suggest-chev {
     color: #c2c6d4;
     font-size: 16px;
-  }
-  .muted {
-    color: #8e8e93;
-    font-size: 13px;
   }
 
   /* Bubble layout */
@@ -1293,18 +1289,10 @@
   /* 自动深色已停用——固定浅色，避免界面随系统深色模式"乱变色"（用户要求）。
      条件 max-width:0 永不匹配 = 整块失效；将来要深色/做切换时去掉这个条件即可。 */
   @media (prefers-color-scheme: dark) and (max-width: 0px) {
-    .banner.muted {
-      background: #2c2c2e;
-      color: #98989d;
-      border-color: #38383a;
-    }
     .banner.error {
       background: #3a1f1d;
       color: #ff6961;
       border-color: #5a2926;
-    }
-    .muted {
-      color: #8e8e93;
     }
     .content {
       background: #38383a;
