@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let session = Session::start(
         session_dir.clone(),
         default_workshop(),
+        session_dir.join("workspace"),
         api_key,
         None,
         ApprovalRegistry::new(),

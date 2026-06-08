@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::persistence::{self, PersistError};
 use crate::agent::role::RoleConfig;
-use crate::agent::roles::default_workshop;
+use crate::agent::roles::{default_seed_role, default_workshop};
+use std::path::PathBuf;
+
 use crate::agent::session_store::{
-    new_workshop_id, workshop_dir, workshops_root, DEFAULT_WORKSHOP,
+    default_workspace_dir, new_workshop_id, workshop_dir, workshops_root, DEFAULT_WORKSHOP,
 };
 
 /// 一个工作室的完整定义。
@@ -32,7 +34,9 @@ pub struct WorkshopDef {
     /// 目录"（现行为）。P3 接 UI 选择器后用它当全室共享的 confinement 边界。
     #[serde(default)]
     pub workspace_path: String,
-    /// 工作室成员（顺序即展示顺序）。
+    /// 工作室成员（顺序即展示顺序）。为空时 [`load_workshop`] 用最新默认重填
+    /// （用于"重置角色到默认"——把 roles 清空即可，name/icon/workspace 保留）。
+    #[serde(default)]
     pub roles: Vec<RoleConfig>,
 }
 
@@ -71,6 +75,28 @@ impl WorkshopDef {
         Ok(())
     }
 
+    /// 按显示名生成一个**唯一**角色 id（用户不用手填）。英文名 → slug（小写、非字母
+    /// 数字转 `_`）；中文/空名 → `role`。冲突则加 `_2`/`_3`…
+    pub fn gen_role_id(&self, display_name: &str) -> String {
+        let mut base: String = display_name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        while base.contains("__") {
+            base = base.replace("__", "_");
+        }
+        let base = base.trim_matches('_');
+        let base = if base.is_empty() { "role" } else { base };
+        if !self.roles.iter().any(|r| r.id == base) {
+            return base.to_string();
+        }
+        (2..)
+            .map(|n| format!("{base}_{n}"))
+            .find(|cand| !self.roles.iter().any(|r| r.id == *cand))
+            .unwrap_or_else(|| base.to_string())
+    }
+
     /// 没有任何协调者时，把第一个角色升为协调者（全室必有一个对接用户的）。
     fn ensure_coordinator(&mut self) {
         if !self.roles.is_empty() && !self.roles.iter().any(|r| r.is_coordinator) {
@@ -87,7 +113,12 @@ fn workshop_json_path(user: &str, ws: &str) -> std::path::PathBuf {
 /// （首次迁移）。读到损坏文件时同样回落种子——保证永远能拿到一个可用定义。
 pub fn load_workshop(user: &str, ws: &str) -> WorkshopDef {
     let path = workshop_json_path(user, ws);
-    if let Ok(Some(def)) = persistence::read_json::<WorkshopDef>(&path) {
+    if let Ok(Some(mut def)) = persistence::read_json::<WorkshopDef>(&path) {
+        // roles 被清空（重置/迁移）→ 用最新默认重填，保留 name/icon/workspace_path。
+        if def.roles.is_empty() {
+            def.roles = default_workshop();
+            let _ = save_workshop(user, ws, &def);
+        }
         return def;
     }
     let def = seed_workshop(ws);
@@ -119,18 +150,35 @@ pub struct WorkshopMeta {
     pub name: String,
     pub icon: String,
     pub member_count: usize,
+    /// 用户指定的自定义工作区间（可空——空=用默认）。
     pub workspace_path: String,
+    /// 默认工作区间路径（`{workshop}/workspace`），给设置面板显示"未设时用它"。
+    pub default_workspace: String,
 }
 
 impl WorkshopMeta {
-    fn from_def(def: &WorkshopDef) -> Self {
+    fn from_def(user: &str, def: &WorkshopDef) -> Self {
         Self {
             id: def.id.clone(),
             name: def.name.clone(),
             icon: def.icon.clone(),
             member_count: def.roles.len(),
             workspace_path: def.workspace_path.clone(),
+            default_workspace: default_workspace_dir(user, &def.id)
+                .to_string_lossy()
+                .into_owned(),
         }
+    }
+}
+
+/// 一个工作室**实际生效**的工作区间（④.d confinement 根）：设置了自定义路径就用它，
+/// 否则用默认 `{workshop}/workspace`。`Session::start` 据此约束 agent 的改/删。
+pub fn effective_workspace(user: &str, ws: &str, def: &WorkshopDef) -> PathBuf {
+    let wp = def.workspace_path.trim();
+    if wp.is_empty() {
+        default_workspace_dir(user, ws)
+    } else {
+        PathBuf::from(wp)
     }
 }
 
@@ -143,34 +191,42 @@ pub fn list_workshops(user: &str) -> Vec<WorkshopMeta> {
             .flatten()
             .filter(|e| e.path().is_dir())
             .filter_map(|e| e.file_name().to_str().map(String::from))
-            .map(|id| WorkshopMeta::from_def(&load_workshop(user, &id)))
+            .map(|id| WorkshopMeta::from_def(user, &load_workshop(user, &id)))
             .collect(),
         Err(_) => Vec::new(),
     };
     if out.is_empty() {
-        out.push(WorkshopMeta::from_def(&load_workshop(user, DEFAULT_WORKSHOP)));
+        out.push(WorkshopMeta::from_def(
+            user,
+            &load_workshop(user, DEFAULT_WORKSHOP),
+        ));
     }
     // 创建时间在 id 前缀里（ws-{millis}_…），按它倒序——新建的在前；ws-default 垫底。
     out.sort_by(|a, b| b.id.cmp(&a.id));
     out
 }
 
-/// 新建工作室：用默认三人组做种子（立刻可用、含协调者），落盘后返回摘要。
+/// 新建工作室：只放**一个默认协调者角色**（对接用户、可改 persona），用户再自行
+/// 添加成员组队——不再默认塞三人组。
 pub fn create_workshop(user: &str, name: &str, icon: &str) -> Result<WorkshopMeta, PersistError> {
     let id = new_workshop_id();
-    let mut def = seed_workshop(&id);
-    def.name = if name.trim().is_empty() {
-        "新工作室".to_string()
-    } else {
-        name.trim().to_string()
-    };
-    def.icon = if icon.trim().is_empty() {
-        "🛠".to_string()
-    } else {
-        icon.trim().to_string()
+    let def = WorkshopDef {
+        id: id.clone(),
+        name: if name.trim().is_empty() {
+            "新工作室".to_string()
+        } else {
+            name.trim().to_string()
+        },
+        icon: if icon.trim().is_empty() {
+            "🛠".to_string()
+        } else {
+            icon.trim().to_string()
+        },
+        workspace_path: String::new(),
+        roles: vec![default_seed_role()],
     };
     save_workshop(user, &id, &def)?;
-    Ok(WorkshopMeta::from_def(&def))
+    Ok(WorkshopMeta::from_def(user, &def))
 }
 
 /// 删除一个工作室（连其会话一起）。拒删最后一个（保证至少留一个）。
@@ -231,6 +287,28 @@ mod tests {
 
         // 清理。
         let _ = std::fs::remove_dir_all(workshop_dir(&user, &ws));
+    }
+
+    #[test]
+    fn create_workshop_seeds_single_coordinator() {
+        let (user, _) = tmp_user_ws();
+        let meta = create_workshop(&user, "我的工作室", "🚀").unwrap();
+        assert_eq!(meta.member_count, 1, "新工作室只给一个默认角色");
+        let def = load_workshop(&user, &meta.id);
+        assert_eq!(def.roles.len(), 1);
+        assert!(def.roles[0].is_coordinator, "唯一的默认角色必须是协调者");
+        let _ = std::fs::remove_dir_all(workshop_dir(&user, &meta.id));
+    }
+
+    #[test]
+    fn gen_role_id_auto_and_unique() {
+        let mut def = seed_workshop("ws-q");
+        assert_eq!(def.gen_role_id("Tester"), "tester");
+        assert_eq!(def.gen_role_id("测试工程师"), "role"); // 无 ascii → role
+        let mut t = default_seed_role();
+        t.id = "tester".to_string();
+        def.upsert_role(t);
+        assert_eq!(def.gen_role_id("Tester"), "tester_2"); // 冲突去重
     }
 
     #[test]

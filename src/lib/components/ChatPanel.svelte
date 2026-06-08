@@ -15,6 +15,7 @@
     type ApprovalRequest,
     type ApprovalDecision
   } from '$lib/ipc';
+  import { md } from '$lib/markdown';
 
   type TimelineItem =
     | { kind: 'message'; ts: number; data: AgentMessage }
@@ -64,8 +65,14 @@
   let bootError = $state<string | null>(null);
   let sendError = $state<string | null>(null);
   // ① 当前会话 id（由 +page 传入）。变化即重载历史；非空即可输入。
-  let { sessionId = '' }: { sessionId?: string } = $props();
+  // onStart：没有活跃会话时，发第一条前先惰性建一个（父组件提供，= 新建会话）。
+  let {
+    sessionId = '',
+    onStart
+  }: { sessionId?: string; onStart?: () => Promise<void> | void } = $props();
   const ready = $derived(!!sessionId);
+  // 惰性建会话会触发 sessionId 变化 → 别让 $effect 重载历史把刚发的实时消息清掉。
+  let skipNextReload = false;
 
   // 空状态的建议卡：点一下把需求填进输入框。
   const SUGGESTIONS = [
@@ -205,6 +212,10 @@
   $effect(() => {
     const sid = sessionId;
     if (!sid) return;
+    if (skipNextReload) {
+      skipNextReload = false;
+      return;
+    }
     loadHistory();
   });
 
@@ -216,14 +227,20 @@
 
   async function handleSend() {
     const text = input.trim();
-    if (!text || sending || !ready) return;
+    if (!text || sending) return;
     sendError = null;
     sending = true;
     input = '';
     try {
+      // 没有活跃会话 → 先惰性建一个（父组件的 onStart），再发。
+      if (!ready) {
+        skipNextReload = true;
+        await onStart?.();
+      }
       await sendUserMessage(text);
     } catch (e) {
       sendError = e instanceof Error ? e.message : String(e);
+      skipNextReload = false;
     } finally {
       sending = false;
     }
@@ -493,22 +510,20 @@
         </div>
         <h2 class="hero-title">多 <span class="grad">Agent</span> 工作室已就绪</h2>
         <p class="hero-sub">
-          {ready ? '默认成员：PM、前端、后端 · 输入一条需求开始' : '点击左侧「＋ 新建」开始一个新会话'}
+          输入一条需求开始 — {ready ? '团队会自动响应' : '会自动为你新建会话'}
         </p>
-        {#if ready}
-          <div class="suggests">
-            {#each SUGGESTIONS as sg (sg.l2)}
-              <button class="suggest" onclick={() => useSuggestion(sg.prompt)}>
-                <span class="suggest-ico" style="background:{sg.tint}">{sg.glyph}</span>
-                <span class="suggest-text">
-                  <small>{sg.l1}</small>
-                  <strong>{sg.l2}</strong>
-                </span>
-                <span class="suggest-chev">›</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
+        <div class="suggests">
+          {#each SUGGESTIONS as sg (sg.l2)}
+            <button class="suggest" onclick={() => useSuggestion(sg.prompt)}>
+              <span class="suggest-ico" style="background:{sg.tint}">{sg.glyph}</span>
+              <span class="suggest-text">
+                <small>{sg.l1}</small>
+                <strong>{sg.l2}</strong>
+              </span>
+              <span class="suggest-chev">›</span>
+            </button>
+          {/each}
+        </div>
       </div>
     {/if}
 
@@ -590,14 +605,14 @@
             <div class="role-label" style:color={s.color}>
               <span>{s.label}</span>
               {#if msg.kind.type === 'ASK_AGENT'}
-                <span class="arrow">→ {styleFor(msg.kind.to).label}</span>
+                <span class="mention" style:color={styleFor(msg.kind.to).color}>@{styleFor(msg.kind.to).label}</span>
               {:else if msg.kind.type === 'ANSWER'}
                 <span class="arrow">↩ 回复</span>
               {/if}
               <span class="kind-tag">{kindTag(msg.kind)}</span>
             </div>
-            <div class="content" style:--accent={s.color}>
-              {primaryText(msg.kind)}
+            <div class="content md-body" style:--accent={s.color}>
+              {@html md(primaryText(msg.kind))}
             </div>
           </div>
         {/if}
@@ -615,12 +630,10 @@
     <div class="composer">
       <textarea
         class="composer-input"
-        placeholder={ready
-          ? '提一个需求 — 例如「做一个简单的 todo Web 应用」…'
-          : '点击左侧「＋ 新建」开始一个会话'}
+        placeholder="提一个需求 — 例如「做一个简单的 todo Web 应用」…"
         bind:value={input}
         onkeydown={handleKeydown}
-        disabled={sending || !ready}
+        disabled={sending}
       ></textarea>
       <div class="composer-bar">
         <div class="composer-tools">
@@ -631,7 +644,7 @@
         </div>
         <div class="composer-send">
           <span class="kbd">⌘↵</span>
-          <button class="send" onclick={handleSend} disabled={sending || !ready || !input.trim()}>
+          <button class="send" onclick={handleSend} disabled={sending || !input.trim()}>
             <span class="send-ico">➤</span>{sending ? '发送中…' : '发送'}
           </button>
         </div>
@@ -850,6 +863,74 @@
     background: #007aff;
     color: #ffffff;
     border-left: none;
+  }
+
+  /* @mention（ASK_AGENT 指向的目标）渲成胶囊 */
+  .mention {
+    font-weight: 600;
+    font-size: 12px;
+    background: rgba(123, 92, 255, 0.12);
+    padding: 1px 7px;
+    border-radius: 999px;
+  }
+
+  /* 渲染后的 markdown 内容（{@html md(...)}，类名在 markdown.ts 里加） */
+  .md-body {
+    white-space: normal;
+  }
+  .md-body :global(.md-p) {
+    margin: 0 0 8px;
+  }
+  .md-body :global(.md-p:last-child) {
+    margin-bottom: 0;
+  }
+  .md-body :global(.md-h) {
+    font-weight: 700;
+    margin: 6px 0;
+  }
+  .md-body :global(.md-h1) {
+    font-size: 1.15em;
+  }
+  .md-body :global(.md-h2) {
+    font-size: 1.08em;
+  }
+  .md-body :global(.md-ul),
+  .md-body :global(.md-ol) {
+    margin: 4px 0 8px;
+    padding-left: 20px;
+  }
+  .md-body :global(li) {
+    margin: 2px 0;
+  }
+  .md-body :global(.md-code) {
+    background: rgba(0, 0, 0, 0.06);
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.92em;
+  }
+  .md-body :global(.md-pre) {
+    background: #1e2230;
+    color: #e6e8f0;
+    border-radius: 10px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 6px 0;
+  }
+  .md-body :global(.md-pre code) {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    white-space: pre;
+  }
+  .md-body :global(.md-a) {
+    color: #6b54ec;
+  }
+  .bubble.user .md-body :global(.md-code) {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  .bubble.user .md-body :global(.md-a) {
+    color: #fff;
+    text-decoration: underline;
   }
 
   /* Info line — WORK_START / PROGRESS / DONE compact rows */

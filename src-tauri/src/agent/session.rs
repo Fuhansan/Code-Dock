@@ -91,15 +91,14 @@ pub enum SessionError {
 /// Canonicalize because the native file tools' confinement check matches the
 /// target against the canonical workspace root (the macOS /var → /private/var
 /// symlink would otherwise look like a path-traversal escape).
-async fn ensure_workspace_dir(session_dir: &PathBuf) -> Result<PathBuf, SessionError> {
-    let raw = session_dir.join(WORKSPACE_SUBDIR);
-    tokio::fs::create_dir_all(&raw)
+async fn ensure_workspace_dir(raw: &PathBuf) -> Result<PathBuf, SessionError> {
+    tokio::fs::create_dir_all(raw)
         .await
         .map_err(|source| SessionError::Workspace {
             context: "create workspace dir",
             source,
         })?;
-    std::fs::canonicalize(&raw).map_err(|source| SessionError::Workspace {
+    std::fs::canonicalize(raw).map_err(|source| SessionError::Workspace {
         context: "canonicalize workspace dir",
         source,
     })
@@ -126,6 +125,7 @@ impl Session {
     pub async fn start(
         session_dir: PathBuf,
         roles: Vec<RoleConfig>,
+        workspace: PathBuf,
         api_key: String,
         app_handle: Option<tauri::AppHandle>,
         approval: ApprovalRegistry,
@@ -139,7 +139,9 @@ impl Session {
         let handle = dispatcher.handle();
 
         let scratchpad_dir = session_dir.join("scratchpads");
-        let workspace_dir = ensure_workspace_dir(&session_dir).await?;
+        // 工作区间 = 工作室级（④.d confinement 根）：自定义路径或默认 {workshop}/workspace。
+        // 由调用方（switch_to）按工作室定义算好传入；dev harness 传 session_dir/workspace。
+        let workspace_dir = ensure_workspace_dir(&workspace).await?;
         let mcp_log_path = session_dir.join(MCP_LOG_FILE);
 
         // Sprint 4 polish: spawn the MCP-call log writer task. Each agent

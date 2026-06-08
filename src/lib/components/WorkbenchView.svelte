@@ -7,6 +7,7 @@
     enterWorkshop,
     deleteWorkshop,
     saveWorkshopSettings,
+    pickDirectory,
     type WorkshopMeta
   } from '$lib/ipc';
 
@@ -40,6 +41,12 @@
     }
   }
 
+  // 点卡片即进入：已设工作区间 → 直接进；未设 → 弹窗（选信任目录 / 用默认目录）。
+  let entryFor = $state<WorkshopMeta | null>(null);
+  function onCardClick(w: WorkshopMeta) {
+    if (w.workspace_path.trim()) doEnter(w.id);
+    else entryFor = w;
+  }
   async function doEnter(id: string) {
     try {
       await enterWorkshop(id);
@@ -47,6 +54,28 @@
     } catch (e) {
       err = e instanceof Error ? e.message : String(e);
     }
+  }
+  // 弹窗：选一个可信目录，存为工作区间后进入。
+  async function pickTrustedAndEnter(w: WorkshopMeta) {
+    try {
+      const dir = await pickDirectory();
+      if (!dir) return; // 取消
+      await saveWorkshopSettings(w.id, w.name, w.icon, dir);
+      entryFor = null;
+      await refresh();
+      await doEnter(w.id);
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    }
+  }
+  async function useDefaultAndEnter(w: WorkshopMeta) {
+    entryFor = null;
+    await doEnter(w.id); // 空工作区间 → 后端回落默认 {workshop}/workspace
+  }
+  // 原生目录选择器（设置弹窗用）。
+  async function pickSettingsDir() {
+    const dir = await pickDirectory();
+    if (dir) sWorkspace = dir;
   }
 
   async function doCreate() {
@@ -133,25 +162,34 @@
   <h2 class="h">我的工作室</h2>
   <div class="wall">
     {#each workshops as w (w.id)}
-      <div class="card" class:active={w.id === activeId}>
+      <div
+        class="card"
+        class:active={w.id === activeId}
+        role="button"
+        tabindex="0"
+        onclick={() => onCardClick(w)}
+        onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && onCardClick(w)}
+      >
         <div class="ch">
           <span class="cico">{w.icon || '🧭'}</span>
-          {#if w.id === activeId}<span class="cur">当前</span>{/if}
+          <span class="ch-r">
+            {#if w.id === activeId}<span class="cur">当前</span>{/if}
+            <button class="ic-btn" title="设置" onclick={(e) => { e.stopPropagation(); openSettings(w); }}>⚙</button>
+            <button
+              class="ic-btn danger"
+              class:armed={pendingDelete === w.id}
+              title="删除"
+              onclick={(e) => { e.stopPropagation(); doDelete(w.id); }}
+            >{pendingDelete === w.id ? '确认?' : '🗑'}</button>
+          </span>
         </div>
         <strong class="cname">{w.name}</strong>
-        <small class="cmeta">{w.member_count} 名成员</small>
+        <small class="cmeta">{w.member_count} 名成员 · 点击进入</small>
         {#if w.workspace_path}
           <small class="cws" title={w.workspace_path}>📁 {w.workspace_path}</small>
         {:else}
-          <small class="cws muted">未设工作区间</small>
+          <small class="cws muted">未设工作区间（进入时选）</small>
         {/if}
-        <div class="cact">
-          <button class="primary sm" onclick={() => doEnter(w.id)}>进入</button>
-          <button class="ghost sm" onclick={() => openSettings(w)}>设置</button>
-          <button class="danger sm" class:armed={pendingDelete === w.id} onclick={() => doDelete(w.id)}>
-            {pendingDelete === w.id ? '确认' : '删除'}
-          </button>
-        </div>
       </div>
     {/each}
   </div>
@@ -166,12 +204,32 @@
       <label class="f ico-f"><span>图标</span><input bind:value={sIcon} maxlength="2" /></label>
       <label class="f"><span>名称</span><input bind:value={sName} /></label>
     </div>
-    <label class="f"><span>工作区间（④.d 可信目录；改/删文件不得越界）</span>
-      <input bind:value={sWorkspace} placeholder="/Users/你/projects/foo（留空=每会话独立目录）" /></label>
-    <p class="hint">填一个已存在的绝对路径。留空则沿用每会话独立 workspace 子目录。</p>
+    <div class="f">
+      <span>工作区间（④.d 可信目录；改/删文件不得越界）</span>
+      <div class="ws-pick">
+        <code class="ws-cur">{sWorkspace || '默认: ' + settingsFor.default_workspace}</code>
+        <button class="ghost sm2" onclick={pickSettingsDir}>选择目录…</button>
+        {#if sWorkspace}<button class="ghost sm2" onclick={() => (sWorkspace = '')}>用默认</button>{/if}
+      </div>
+    </div>
+    <p class="hint">选一个可信目录；留空则用默认 <code>{settingsFor.default_workspace}</code>（全室共享）。</p>
     <div class="mact">
       <button class="ghost" onclick={() => (settingsFor = null)} disabled={savingSettings}>取消</button>
       <button class="primary" onclick={saveSettings} disabled={savingSettings}>{savingSettings ? '保存中…' : '保存'}</button>
+    </div>
+  </div>
+{/if}
+
+{#if entryFor}
+  <div class="ov" onclick={() => (entryFor = null)} role="presentation"></div>
+  <div class="modal" role="dialog" aria-modal="true">
+    <h3>进入「{entryFor.name}」</h3>
+    <p class="hint">这个工作室还没设工作区间（agent 改/删文件的可信目录）。选一个可信目录，或先用默认。</p>
+    <div class="f"><span>默认目录</span><code class="ws-cur">{entryFor.default_workspace}</code></div>
+    <div class="mact">
+      <button class="ghost" onclick={() => (entryFor = null)}>取消</button>
+      <button class="ghost" onclick={() => useDefaultAndEnter(entryFor!)}>用默认目录</button>
+      <button class="primary" onclick={() => pickTrustedAndEnter(entryFor!)}>选择信任目录…</button>
     </div>
   </div>
 {/if}
@@ -300,10 +358,66 @@
   .cws.muted {
     color: #b6bacb;
   }
-  .cact {
+  .card {
+    cursor: pointer;
+    transition:
+      box-shadow 0.12s,
+      transform 0.08s;
+  }
+  .card:hover {
+    box-shadow: 0 8px 24px rgba(28, 30, 60, 0.12);
+    transform: translateY(-1px);
+  }
+  .ch-r {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ic-btn {
+    border: none;
+    background: #f1f2f6;
+    border-radius: 8px;
+    width: 28px;
+    height: 26px;
+    cursor: pointer;
+    font-size: 13px;
+    color: #555b73;
+    padding: 0;
+  }
+  .ic-btn:hover {
+    background: #e7e8ee;
+  }
+  .ic-btn.danger {
+    color: #ef4444;
+  }
+  .ic-btn.danger.armed {
+    background: #ef4444;
+    color: #fff;
+    width: auto;
+    padding: 0 8px;
+  }
+  .ws-pick {
     display: flex;
-    gap: 7px;
-    margin-top: 12px;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ws-cur {
+    flex: 1;
+    min-width: 140px;
+    background: #f5f6fa;
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+    color: #555b73;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sm2 {
+    padding: 6px 12px;
+    font-size: 12.5px;
+    flex: none;
   }
   button {
     border: none;
@@ -322,21 +436,6 @@
     color: #2b2f45;
     padding: 8px 14px;
     font-size: 13.5px;
-  }
-  .danger {
-    background: #fdeceb;
-    color: #ef4444;
-    padding: 8px 14px;
-    font-size: 13.5px;
-  }
-  .danger.armed {
-    background: #ef4444;
-    color: #fff;
-  }
-  .sm {
-    padding: 6px 12px;
-    font-size: 12.5px;
-    flex: 1;
   }
   button:disabled {
     opacity: 0.6;

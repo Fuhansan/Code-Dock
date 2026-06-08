@@ -413,7 +413,7 @@
     {#if keyConfigured === null}
       <div class="loading">正在加载…</div>
     {:else if keyConfigured}
-      <ChatPanel sessionId={activeSessionId} />
+      <ChatPanel sessionId={activeSessionId} onStart={onNewSession} />
     {:else}
       <div class="loading muted">请先配置 LLM Provider</div>
     {/if}

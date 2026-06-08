@@ -270,7 +270,7 @@ export interface PermissionRule {
   action: string; // RuleAction (snake_case)，编辑器暂原样携带
 }
 export type LoopMode = 'single' | 'react' | 'plan_execute';
-export type SecurityLevel = 'Strict' | 'Standard' | 'Permissive';
+export type SecurityLevel = 'strict' | 'standard' | 'permissive';
 
 export interface RoleConfig {
   id: string;
@@ -339,7 +339,10 @@ export interface WorkshopMeta {
   name: string;
   icon: string;
   member_count: number;
+  /** User-set custom trusted dir (empty = use default). */
   workspace_path: string;
+  /** Default trusted dir ({workshop}/workspace), shown when none is set. */
+  default_workspace: string;
 }
 
 /** All of the user's workshops (for the workbench card wall). */
@@ -365,6 +368,12 @@ export function enterWorkshop(id: string): Promise<void> {
 /** Delete a workshop (and its sessions); switches away if it was active. */
 export function deleteWorkshop(id: string): Promise<void> {
   return invoke('delete_workshop', { id });
+}
+
+/** Open a native directory picker; resolves to the chosen path, or null if
+ *  cancelled. Uses the dialog plugin's Rust side (no JS package needed). */
+export function pickDirectory(): Promise<string | null> {
+  return invoke('pick_directory');
 }
 
 /** Update a workshop's name/icon/workspace path. */

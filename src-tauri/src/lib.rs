@@ -34,6 +34,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
@@ -59,6 +60,7 @@ pub fn run() {
             commands::enter_workshop,
             commands::delete_workshop,
             commands::save_workshop_settings,
+            commands::pick_directory,
             commands::session_status,
             commands::send_user_message,
             commands::load_message_history,

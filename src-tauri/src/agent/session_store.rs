@@ -43,6 +43,12 @@ pub fn new_workshop_id() -> String {
     format!("ws-{}", new_session_id())
 }
 
+/// 一个工作室的**默认工作区间**（④.d 可信目录）：`{workshop}/workspace`。
+/// 用户没在设置里指定自定义目录时回落到它（全室共享，跨会话）。
+pub fn default_workspace_dir(user: &str, workshop: &str) -> PathBuf {
+    workshop_dir(user, workshop).join("workspace")
+}
+
 /// `.../users/{user}/workshops/{workshop}/sessions`
 pub fn sessions_dir(user: &str, workshop: &str) -> PathBuf {
     workshop_dir(user, workshop).join("sessions")

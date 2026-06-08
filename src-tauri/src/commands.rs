@@ -175,12 +175,15 @@ async fn switch_to(
     {
         *state.session.lock().await = None;
     }
-    // 角色来自工作室定义（workshop.json，没有则种子）——而非写死。这样改了工作室
-    // 定义后重建会话即换上新角色（P2 热应用的机制基础）。
-    let roles = workshop_store::load_workshop(USER, &current_ws(state).await).roles;
+    // 角色 + 工作区间都来自工作室定义（workshop.json，没有则种子）——而非写死。
+    // 工作区间 = 自定义路径或默认 {workshop}/workspace（④.d confinement 根）。
+    let ws = current_ws(state).await;
+    let def = workshop_store::load_workshop(USER, &ws);
+    let workspace = workshop_store::effective_workspace(USER, &ws, &def);
     let session = Session::start(
         dir.clone(),
-        roles,
+        def.roles,
+        workspace,
         key,
         Some(app),
         state.approval.clone(),
@@ -370,12 +373,16 @@ pub async fn get_workshop(
 /// 增/改一个角色（按 id upsert，强制协调者全室唯一），落盘后**热应用**到在跑会话。
 #[tauri::command]
 pub async fn save_role(
-    role: RoleConfig,
+    mut role: RoleConfig,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), CommandError> {
     let ws = current_ws(&state).await;
     let mut def = workshop_store::load_workshop(USER, &ws);
+    // 新角色 id 留空 → 按名称系统生成（用户不用手填）。
+    if role.id.trim().is_empty() {
+        role.id = def.gen_role_id(&role.display_name);
+    }
     def.upsert_role(role);
     workshop_store::save_workshop(USER, &ws, &def)
         .map_err(|e| CommandError::Llm(LLMError::Other(format!("save role failed: {e}"))))?;
@@ -462,6 +469,25 @@ pub async fn available_tools() -> Result<Vec<ToolCatalogEntry>, CommandError> {
 #[tauri::command]
 pub async fn model_catalog() -> Result<Vec<String>, CommandError> {
     Ok(vec!["qwen3.6-plus".to_string(), "qwen3.6-flash".to_string()])
+}
+
+/// 弹原生目录选择器，返回选中目录的绝对路径（取消则 None）。前端用它选工作区间，
+/// 不走 `@tauri-apps/plugin-dialog` JS 包（直接用插件的 Rust API）。在 blocking 线程
+/// 上跑——原生对话框由插件内部派发到主线程。
+#[tauri::command]
+pub async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
+    let picked = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .set_title("选择工作区间（可信目录）")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| CommandError::Llm(LLMError::Other(format!("dialog join: {e}"))))?;
+    Ok(picked
+        .and_then(|fp| fp.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
 }
 
 // ---------- 工作室生命周期（P3：工作台多工作室）----------

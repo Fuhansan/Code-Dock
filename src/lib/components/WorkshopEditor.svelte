@@ -42,7 +42,7 @@
     )
   );
 
-  const SEC_LABEL: Record<string, string> = { Strict: '严格', Standard: '标准', Permissive: '宽松' };
+  const SEC_LABEL: Record<string, string> = { strict: '严格', standard: '标准', permissive: '宽松' };
 
   function blankRole(): RoleConfig {
     return {
@@ -64,7 +64,7 @@
       teammates: [],
       loop_mode: 'single',
       max_history_tokens: 32000,
-      security_level: 'Standard',
+      security_level: 'standard',
       permission_rules: []
     };
   }
@@ -101,16 +101,12 @@
   async function commit() {
     if (!editing) return;
     const r = editing;
-    if (!r.id.trim()) {
-      formErr = '角色 id 不能为空';
+    if (!r.display_name.trim()) {
+      formErr = '请填写名称';
       return;
     }
-    if (isNew && ws?.roles.some((x) => x.id === r.id.trim())) {
-      formErr = '该角色 id 已存在';
-      return;
-    }
-    r.id = r.id.trim();
-    r.display_name = r.display_name.trim() || r.id;
+    r.display_name = r.display_name.trim();
+    // id：新角色留空 → 后端按名称自动生成；老角色保持原 id。
     saving = true;
     formErr = '';
     try {
@@ -200,11 +196,8 @@
       {#if formErr}<div class="err">{formErr}</div>{/if}
 
       <h3 class="sec">基础</h3>
-      {#if isNew}
-        <label class="f"><span>角色 id（英文，唯一）</span>
-          <input bind:value={editing.id} placeholder="如 tester / designer" /></label>
-      {/if}
-      <label class="f"><span>名称</span><input bind:value={editing.display_name} /></label>
+      <label class="f"><span>名称{#if isNew}（id 由系统生成）{/if}</span>
+        <input bind:value={editing.display_name} placeholder="如 测试工程师 / Designer" /></label>
       <label class="f"><span>描述</span><input bind:value={editing.description} /></label>
       <label class="ck"><input type="checkbox" bind:checked={editing.is_coordinator} />
         设为协调者（承接用户对话，全室唯一——勾它会自动取消别人）</label>
@@ -242,7 +235,7 @@
 
       <div class="f col"><span>安全级别</span>
         <div class="radios">
-          {#each ['Strict', 'Standard', 'Permissive'] as lv (lv)}
+          {#each ['strict', 'standard', 'permissive'] as lv (lv)}
             <label class="rd"><input type="radio" value={lv} bind:group={editing.security_level} />{SEC_LABEL[lv]}</label>
           {/each}
         </div>
